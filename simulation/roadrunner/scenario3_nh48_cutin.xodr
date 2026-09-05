@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ASAM OpenDRIVE 1.6: NH-48 Jaipur Highway Merge (SIH26037 Scenario 3) -->
+<OpenDRIVE>
+    <header revMajor="1" revMinor="6" name="NH48_Jaipur_Merge" version="1.00" date="2026-09-06" north="27.2154" east="75.9812" />
+    <road name="NH48_Carriageway" length="300.00" id="1" junction="-1">
+        <planView><geometry s="0.0" x="0.0" y="0.0" hdg="0.0" length="300.0"><line/></geometry></planView>
+        <lanes>
+            <laneSection s="0.0">
+                <left><lane id="1" type="driving"><width s="0.0" a="3.6" b="0.0" c="0.0" d="0.0"/></lane></left>
+                <center><lane id="0" type="none"/></center>
+                <right>
+                    <lane id="-1" type="driving"><width s="0.0" a="3.6" b="0.0" c="0.0" d="0.0"/></lane>
+                    <lane id="-2" type="shoulder"><width s="0.0" a="2.0" b="0.0" c="0.0" d="0.0"/></lane>
+                </right>
+            </laneSection>
+        </lanes>
+    </road>
+</OpenDRIVE>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ASAM OpenDRIVE 1.6: Chandni Chowk Dense Market (SIH26037 Scenario 4) -->
+<OpenDRIVE>
+    <header revMajor="1" revMinor="6" name="Chandni_Chowk_Market" version="1.00" date="2026-09-06" north="28.6506" east="77.2303" />
+    <road name="Bazaar_Lane" length="150.00" id="1" junction="-1">
+        <planView><geometry s="0.0" x="0.0" y="0.0" hdg="0.0" length="150.0"><line/></geometry></planView>
+        <lanes>
+            <laneSection s="0.0">
+                <left><lane id="1" type="driving"><width s="0.0" a="2.4" b="0.0" c="0.0" d="0.0"/><roadMark type="none"/></lane></left>
+                <center><lane id="0" type="none"/></center>
+                <right><lane id="-1" type="driving"><width s="0.0" a="2.4" b="0.0" c="0.0" d="0.0"/><roadMark type="none"/></lane></right>
+            </laneSection>
+        </lanes>
+    </road>
+</OpenDRIVE>

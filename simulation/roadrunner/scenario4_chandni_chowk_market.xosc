@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ASAM OpenSCENARIO 1.0: Dense Market Street Swarm (SIH26037 Scenario 4) -->
+<OpenSCENARIO>
+    <FileHeader revMajor="1" revMinor="0" date="2026-09-06" description="Market Street with Vendor Pushcarts and Pedestrian Swarms" author="SIH26037 Core Team"/>
+    <Entities>
+        <ScenarioObject name="EgoVehicle"><Vehicle name="EgoSedan" vehicleCategory="car"/></ScenarioObject>
+        <ScenarioObject name="PushcartVendor"><Pedestrian name="Vegetable_Pushcart"/></ScenarioObject>
+        <ScenarioObject name="MarketShopper"><Pedestrian name="Pedestrian_Shopper"/></ScenarioObject>
+    </Entities>
+</OpenSCENARIO>

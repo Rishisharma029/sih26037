@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ASAM OpenSCENARIO 1.0: Bengaluru Unsignalized Junction Swarm (SIH26037 Scenario 2) -->
+<OpenSCENARIO>
+    <FileHeader revMajor="1" revMinor="0" date="2026-09-06" description="Unsignalled Intersection Swarm with Crossing Auto and Filtering Motorcycles" author="SIH26037 Core Team"/>
+    <Entities>
+        <ScenarioObject name="EgoVehicle"><Vehicle name="EgoSedan" vehicleCategory="car"/></ScenarioObject>
+        <ScenarioObject name="PerpendicularAuto"><Vehicle name="Bajaj_Compact_4S" vehicleCategory="car"/></ScenarioObject>
+        <ScenarioObject name="FilteringMotorcycle"><Vehicle name="Hero_Splendor" vehicleCategory="motorcycle"/></ScenarioObject>
+    </Entities>
+</OpenSCENARIO>

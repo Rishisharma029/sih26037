@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ASAM OpenSCENARIO 1.0: Stray Cattle Roadblock (SIH26037 Scenario 5) -->
+<OpenSCENARIO>
+    <FileHeader revMajor="1" revMinor="0" date="2026-09-06" description="Stray Cattle Resting in Middle of State Highway Blind Curve" author="SIH26037 Core Team"/>
+    <Entities>
+        <ScenarioObject name="EgoVehicle"><Vehicle name="EgoSedan" vehicleCategory="car"/></ScenarioObject>
+        <ScenarioObject name="HolyCow"><Vehicle name="Indian_Desi_Cow" vehicleCategory="car"/></ScenarioObject>
+    </Entities>
+</OpenSCENARIO>

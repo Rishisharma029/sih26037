@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ASAM OpenSCENARIO 1.0: NH-48 Aggressive Auto-Rickshaw Cut-in (SIH26037 Scenario 3) -->
+<OpenSCENARIO>
+    <FileHeader revMajor="1" revMinor="0" date="2026-09-06" description="Highway Sudden Cut-In from Shoulder at High Speed Differential" author="SIH26037 Core Team"/>
+    <Entities>
+        <ScenarioObject name="EgoVehicle"><Vehicle name="EgoSedan" vehicleCategory="car"/></ScenarioObject>
+        <ScenarioObject name="CutinTempo"><Vehicle name="Piaggio_Ape_Commercial" vehicleCategory="car"/></ScenarioObject>
+    </Entities>
+</OpenSCENARIO>

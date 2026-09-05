@@ -13,14 +13,28 @@ class TTCCalculator:
         results = []
         min_ttc = float("inf")
         closest_id = None
+
+        ego_x = ego_state.pose.position.x
+        ego_y = ego_state.pose.position.y
         ego_vx = ego_state.twist.speed_mps * math.cos(ego_state.pose.heading_rad)
+        ego_vy = ego_state.twist.speed_mps * math.sin(ego_state.pose.heading_rad)
 
         for obs in obstacles:
-            rel_dx = obs.bbox.center.x
-            rel_vx = ego_vx - obs.velocity.x
+            dx = obs.bbox.center.x - ego_x
+            dy = obs.bbox.center.y - ego_y
+            dist = math.hypot(dx, dy)
 
-            if rel_vx > 0.1 and rel_dx > 0.0:
-                ttc = rel_dx / rel_vx
+            rel_vx = ego_vx - obs.velocity.x
+            rel_vy = ego_vy - obs.velocity.y
+
+            # 2D Closing velocity projected along range vector
+            closing_speed = (dx * rel_vx + dy * rel_vy) / max(0.1, dist)
+
+            # Collision swath for head-on conflict is within 0.95m of vehicle centerline
+            if dx > 0.0 and abs(dy) < 0.95 and closing_speed > 0.2:
+                ttc = dist / closing_speed
+            elif 0.0 < dx < 25.0 and abs(dy) < 0.95 and ego_vx > 0.3:
+                ttc = dx / ego_vx
             else:
                 ttc = float("inf")
 
@@ -28,7 +42,7 @@ class TTCCalculator:
             results.append(TTCResult(
                 obstacle_id=obs.id,
                 ttc_seconds=ttc,
-                distance_at_cpa_m=max(0.0, rel_dx),
+                distance_at_cpa_m=dist,
                 is_critical=is_crit
             ))
 
