@@ -1,25 +1,176 @@
-"""Unit tests for planning subsystem."""
-from planning.local_planner import AdaptiveLatticePlanner
+"""Comprehensive Unit & Scenario Tests for Phase 6 Adaptive Lattice Planner."""
+import math
+import pytest
+
 from interfaces import (
     EgoVehicleState, Pose3D, Point3D, Twist3D, Vector3D,
-    PerceptionOutput, FreeSpaceCorridor, PredictionOutput, BehaviorMode
+    PerceptionOutput, FreeSpaceCorridor, PredictionOutput,
+    PredictedAgent, PredictedTrajectory, PredictedTrajectoryPoint,
+    ObstacleClass, MotionIntent, BehaviorMode, TrackedObstacle, BoundingBox3D
 )
+from planning.frenet_lattice import FrenetLatticeGenerator, QuinticPolynomial
+from planning.cost_evaluator import TrajectoryCostEvaluator
+from planning.local_planner import AdaptiveLatticePlanner
 
-def test_cruise_planning():
-    planner = AdaptiveLatticePlanner(horizon_seconds=2.0, dt=0.5)
-    ego = EgoVehicleState(
-        timestamp=0.0,
-        pose=Pose3D(position=Point3D(x=0.0, y=0.0, z=0.0)),
-        twist=Twist3D(speed_mps=5.0),
+
+def _create_mock_ego(x: float = 0.0, y: float = 0.0, speed: float = 6.0) -> EgoVehicleState:
+    return EgoVehicleState(
+        timestamp=10.0,
+        pose=Pose3D(position=Point3D(x=x, y=y, z=0.0), heading_rad=0.0),
+        twist=Twist3D(speed_mps=speed),
         acceleration=Vector3D(x=0.0, y=0.0, z=0.0)
     )
-    perc = PerceptionOutput(
-        timestamp=0.0, frame_id=1, obstacles=[],
-        drivable_corridor=FreeSpaceCorridor(timestamp=0.0, boundary_points=[], average_width_m=6.0)
+
+
+def test_quintic_polynomial_boundary_conditions():
+    """Verify that quintic polynomial satisfies exact start and end boundary conditions."""
+    poly = QuinticPolynomial(
+        xs=0.0, vxs=5.0, axs=0.0,
+        xe=20.0, vxe=8.0, axe=0.0,
+        T=3.0
     )
-    pred = PredictionOutput(timestamp=0.0, horizon_seconds=2.0, agents=[])
+    # Start conditions
+    assert pytest.approx(poly.calc_point(0.0), abs=1e-3) == 0.0
+    assert pytest.approx(poly.calc_first_derivative(0.0), abs=1e-3) == 5.0
+    assert pytest.approx(poly.calc_second_derivative(0.0), abs=1e-3) == 0.0
+
+    # End conditions
+    assert pytest.approx(poly.calc_point(3.0), abs=1e-2) == 20.0
+    assert pytest.approx(poly.calc_first_derivative(3.0), abs=1e-2) == 8.0
+    assert pytest.approx(poly.calc_second_derivative(3.0), abs=1e-2) == 0.0
+
+
+def test_lattice_generator_sampling_diversity():
+    """Verify lattice generator produces candidates covering multiple lateral offsets and speeds."""
+    gen = FrenetLatticeGenerator(dt=0.2)
+    ego = _create_mock_ego(speed=6.0)
+    candidates = gen.sample_candidates(ego, target_cruise_speed_mps=8.0)
+
+    assert len(candidates) > 20
+    # Check that lateral targets span left and right
+    targets = set(c.target_d for c in candidates)
+    assert -1.2 in targets
+    assert 0.0 in targets
+    assert 1.2 in targets
+
+
+def test_cruise_nominal_planning():
+    """Verify nominal planning in free road selects straight cruise mode."""
+    planner = AdaptiveLatticePlanner(horizon_seconds=3.0, dt=0.2)
+    ego = _create_mock_ego(speed=6.0)
+    perc = PerceptionOutput(
+        timestamp=10.0, frame_id=1, obstacles=[],
+        drivable_corridor=FreeSpaceCorridor(timestamp=10.0, boundary_points=[], average_width_m=6.5)
+    )
+    pred = PredictionOutput(timestamp=10.0, horizon_seconds=3.0, agents=[])
+
+    plan = planner.plan(ego, perc, pred, target_cruise_speed_mps=8.0)
+
+    assert plan.is_feasible
+    assert plan.behavior_mode == BehaviorMode.CRUISE
+    # Selected path should stay centered near y=0
+    assert abs(plan.waypoints[-1].y) <= 0.6
+    assert plan.waypoints[-1].speed_mps >= 6.0
+
+
+def test_obstacle_avoidance_nudge():
+    """Verify planner generates a lateral nudge trajectory around a stationary obstacle in lane center."""
+    planner = AdaptiveLatticePlanner(horizon_seconds=3.0, dt=0.2)
+    ego = _create_mock_ego(x=0.0, y=0.0, speed=6.0)
+
+    # Obstacle blocking center lane at x=15m, y=0.0m
+    obs_lead = TrackedObstacle(
+        id="parked_auto",
+        obstacle_class=ObstacleClass.AUTO_RICKSHAW,
+        confidence=0.95,
+        bbox=BoundingBox3D(center=Point3D(x=15.0, y=0.0, z=0.5), size=Vector3D(x=2.5, y=1.4, z=1.6)),
+        velocity=Vector3D(x=0.0, y=0.0, z=0.0),
+        distance_m=15.0,
+        is_static=True
+    )
+
+    # Multi-modal prediction: stationary track at x=15, y=0
+    pred_agent = PredictedAgent(
+        id="parked_auto",
+        obstacle_class=ObstacleClass.AUTO_RICKSHAW,
+        primary_intent=MotionIntent.STATIONARY,
+        trajectories=[
+            PredictedTrajectory(
+                probability=1.0,
+                mode_name="stationary",
+                waypoints=[
+                    PredictedTrajectoryPoint(
+                        timestamp=10.0 + step * 0.2,
+                        position=Point3D(x=15.0, y=0.0, z=0.5),
+                        velocity=Vector3D(x=0.0, y=0.0, z=0.0),
+                        yaw_rad=0.0,
+                        sigma_x=0.1,
+                        sigma_y=0.1
+                    )
+                    for step in range(1, 16)
+                ]
+            )
+        ]
+    )
+
+    perc = PerceptionOutput(
+        timestamp=10.0, frame_id=1,
+        obstacles=[obs_lead],
+        drivable_corridor=FreeSpaceCorridor(timestamp=10.0, boundary_points=[], average_width_m=6.5)
+    )
+    pred = PredictionOutput(timestamp=10.0, horizon_seconds=3.0, agents=[pred_agent])
+
     plan = planner.plan(ego, perc, pred, target_cruise_speed_mps=6.0)
 
-    assert plan.behavior_mode == BehaviorMode.CRUISE
-    assert len(plan.waypoints) == 4
-    assert plan.waypoints[-1].x > 0.0
+    assert plan.is_feasible
+    # Planner must choose to nudge left or right around the parked auto (not straight collision)
+    assert plan.behavior_mode in [BehaviorMode.NUDGE_LEFT, BehaviorMode.NUDGE_RIGHT]
+    assert abs(plan.waypoints[-1].y) >= 0.5
+
+
+def test_cost_evaluator_uncertainty_penalty():
+    """Verify cost evaluator penalizes trajectories encroaching on high-uncertainty actor regions."""
+    evaluator = TrajectoryCostEvaluator()
+    gen = FrenetLatticeGenerator(dt=0.2)
+    ego = _create_mock_ego(speed=6.0)
+    candidates = gen.sample_candidates(ego, target_cruise_speed_mps=6.0)
+
+    # Actor at x=12, y=1.2 with large lateral sigma_y = 0.8m
+    agent_uncertain = PredictedAgent(
+        id="moto_weaving",
+        obstacle_class=ObstacleClass.MOTORCYCLE,
+        primary_intent=MotionIntent.ERRATIC_SWERVE,
+        trajectories=[
+            PredictedTrajectory(
+                probability=0.8,
+                mode_name="nudge",
+                waypoints=[
+                    PredictedTrajectoryPoint(
+                        timestamp=10.0 + step * 0.2,
+                        position=Point3D(x=12.0, y=1.2, z=0.5),
+                        velocity=Vector3D(x=2.0, y=0.2, z=0.0),
+                        yaw_rad=0.0,
+                        sigma_x=0.5,
+                        sigma_y=0.8
+                    )
+                    for step in range(1, 16)
+                ]
+            )
+        ]
+    )
+
+    perc = PerceptionOutput(
+        timestamp=10.0, frame_id=1, obstacles=[],
+        drivable_corridor=FreeSpaceCorridor(timestamp=10.0, boundary_points=[], average_width_m=6.5)
+    )
+    pred = PredictionOutput(timestamp=10.0, horizon_seconds=3.0, agents=[agent_uncertain])
+
+    # Candidate passing through y=1.2 should have much higher cost than candidate passing through y=-1.2
+    cand_near = next(c for c in candidates if c.target_d == 1.2 and c.target_v > 4.0)
+    cand_far = next(c for c in candidates if c.target_d == -1.2 and c.target_v > 4.0)
+
+    score_near = evaluator.evaluate(cand_near, perc, pred, target_cruise_speed_mps=6.0)
+    score_far = evaluator.evaluate(cand_far, perc, pred, target_cruise_speed_mps=6.0)
+
+    assert score_near.cost_breakdown["uncertainty"] > score_far.cost_breakdown["uncertainty"]
+    assert score_near.total_cost > score_far.total_cost
