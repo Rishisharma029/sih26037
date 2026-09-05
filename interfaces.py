@@ -118,6 +118,7 @@ class SafetyAction(str, Enum):
     ADAPTIVE_CRUISE_SLOWDOWN = "ADAPTIVE_CRUISE_SLOWDOWN"
     CORRIDOR_NUDGE = "CORRIDOR_NUDGE"
     CONTROL_BARRIER_OVERRIDE = "CONTROL_BARRIER_OVERRIDE"
+    EMERGENCY_REPLAN = "EMERGENCY_REPLAN"
     EMERGENCY_BRAKE = "EMERGENCY_BRAKE"
 
 
@@ -300,6 +301,8 @@ class SafeTrajectory(BaseModel):
     is_emergency_stop: bool = Field(False)
     barrier_margin_m: float = Field(..., description="Minimum distance margin to nearest constraint")
     min_ttc_seconds: float = Field(..., ge=0.0)
+    replan_recommended: bool = Field(False, description="True if safety layer requests an emergency replan")
+    safety_status_reason: str = Field("SAFE", description="Diagnostic explanation from safety layer")
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,136 @@
+"""Dedicated Safety Supervisory Layer for Trajectory Arbitration & Collision Avoidance."""
+import math
+from typing import Optional, List, Tuple
+from interfaces import (
+    PlannedTrajectory, SafeTrajectory, SafetyAction,
+    EgoVehicleState, PerceptionOutput, PredictionOutput,
+    MotionIntent, ObstacleClass
+)
+from .ttc_calculator import TTCCalculator
+from .control_barrier_functions import ControlBarrierFilter
+
+
+class SafetySupervisoryLayer:
+    """Dedicated Independent Safety Supervisory Layer.
+
+    Acts as an external arbiter outside the planner to verify candidate trajectories,
+    enforce Control Barrier Function invariants, trigger Emergency Re-plans for unexpected
+    actor incursions, and activate Autonomous Emergency Braking (AEB) when TTC breaches thresholds.
+    """
+
+    def __init__(
+        self,
+        aeb_ttc_threshold_s: float = 0.85,
+        warning_ttc_threshold_s: float = 1.6,
+        min_barrier_dist_m: float = 1.5
+    ):
+        self.aeb_ttc_threshold_s = aeb_ttc_threshold_s
+        self.warning_ttc_threshold_s = warning_ttc_threshold_s
+        self.ttc_calc = TTCCalculator(
+            warning_threshold_s=warning_ttc_threshold_s,
+            critical_threshold_s=aeb_ttc_threshold_s
+        )
+        self.cbf_filter = ControlBarrierFilter(min_safe_dist_m=min_barrier_dist_m)
+
+    def supervise(
+        self,
+        planned: PlannedTrajectory,
+        ego_state: EgoVehicleState,
+        perception: PerceptionOutput,
+        prediction: PredictionOutput
+    ) -> SafeTrajectory:
+        """Independently verifies planned trajectory against hard safety constraints."""
+        # 1. Evaluate Dynamic Time-to-Collision
+        risk = self.ttc_calc.compute_ttc(ego_state, perception.obstacles)
+
+        # 2. Evaluate Control Barrier Functions (CBF)
+        filtered_traj, barrier_violated, barrier_margin = self.cbf_filter.filter_trajectory(
+            planned, ego_state, perception
+        )
+
+        # 3. Check for Unexpected Obstacle Incursion / Rapid Cut-ins
+        unexpected_incursion, incursion_id = self._check_unexpected_incursion(
+            planned, ego_state, perception, prediction
+        )
+
+        safety_action = SafetyAction.NONE
+        is_e_stop = False
+        replan_recommended = False
+        safety_status_reason = "TRAJECTORY_VERIFIED_SAFE"
+
+        # Priority 1: Critical TTC or Imminent Impact -> Autonomous Emergency Braking (AEB)
+        if risk.min_ttc_seconds < self.aeb_ttc_threshold_s:
+            safety_action = SafetyAction.EMERGENCY_BRAKE
+            is_e_stop = True
+            replan_recommended = False
+            safety_status_reason = f"CRITICAL_TTC_AEB_TRIGGERED (TTC={risk.min_ttc_seconds:0.2f}s)"
+            for wp in filtered_traj.waypoints:
+                wp.speed_mps = 0.0
+                wp.acceleration_mps2 = -6.5
+
+        # Priority 2: Unexpected Dynamic Obstacle Incursion -> Emergency Re-plan
+        elif unexpected_incursion:
+            safety_action = SafetyAction.EMERGENCY_REPLAN
+            replan_recommended = True
+            safety_status_reason = f"UNEXPECTED_OBSTACLE_INCURSION ({incursion_id}) -> EMERGENCY_REPLAN"
+            # Apply safe slowdown while awaiting re-plan
+            for wp in filtered_traj.waypoints:
+                wp.speed_mps = min(wp.speed_mps, max(1.5, ego_state.twist.speed_mps * 0.5))
+                wp.acceleration_mps2 = -2.5
+
+        # Priority 3: Control Barrier Function Override
+        elif barrier_violated:
+            safety_action = SafetyAction.CONTROL_BARRIER_OVERRIDE
+            safety_status_reason = f"CONTROL_BARRIER_OVERRIDE (Margin={barrier_margin:0.2f}m)"
+
+        # Priority 4: Planned Nudge / Follow / Cruise Confirmation
+        elif planned.behavior_mode.value.startswith("NUDGE"):
+            safety_action = SafetyAction.CORRIDOR_NUDGE
+            safety_status_reason = "PLANNED_NUDGE_VERIFIED"
+        elif planned.behavior_mode.value == "FOLLOW":
+            safety_action = SafetyAction.ADAPTIVE_CRUISE_SLOWDOWN
+            safety_status_reason = "SAFE_FOLLOW_VERIFIED"
+
+        closest_dist = min([obs.distance_m for obs in perception.obstacles], default=999.0)
+
+        return SafeTrajectory(
+            timestamp=ego_state.timestamp,
+            source_trajectory_id=planned.trajectory_id,
+            waypoints=filtered_traj.waypoints,
+            safety_action=safety_action,
+            is_emergency_stop=is_e_stop,
+            barrier_margin_m=min(closest_dist, barrier_margin),
+            min_ttc_seconds=risk.min_ttc_seconds,
+            replan_recommended=replan_recommended,
+            safety_status_reason=safety_status_reason
+        )
+
+    def _check_unexpected_incursion(
+        self,
+        planned: PlannedTrajectory,
+        ego_state: EgoVehicleState,
+        perception: PerceptionOutput,
+        prediction: PredictionOutput
+    ) -> Tuple[bool, Optional[str]]:
+        """Detects if an actor is cutting-in or crossing directly into the planned path swath."""
+        for agent in prediction.agents:
+            if agent.is_high_risk or agent.primary_intent in [
+                MotionIntent.CUTTING_IN,
+                MotionIntent.ERRATIC_SWERVE,
+                MotionIntent.CROSSING_PATH
+            ]:
+                # Check intersection between agent's trajectories and planned waypoints
+                for traj in agent.trajectories:
+                    if traj.probability >= 0.30:
+                        for step_idx, ego_wp in enumerate(planned.waypoints[:8]):
+                            if step_idx < len(traj.waypoints):
+                                ag_wp = traj.waypoints[step_idx]
+                                dist = math.hypot(ego_wp.x - ag_wp.position.x, ego_wp.y - ag_wp.position.y)
+                                if dist < 1.8: # Incursion into travel envelope
+                                    return True, agent.id
+
+        return False, None
+
+
+# Backward-compatible alias
+EmergencyBrakeSupervisory = SafetySupervisoryLayer
