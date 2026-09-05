@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ASAM OpenSCENARIO 1.0: Unmarked Village Road Scenario (SIH26037) -->
+<OpenSCENARIO>
+    <FileHeader revMajor="1" revMinor="0" date="2026-09-06" description="Unmarked Indian Village Road Benchmark with Tractor and Crossing Pedestrian" author="SIH26037 Core Team"/>
+    <ParameterDeclarations/>
+    <CatalogLocations/>
+    <RoadNetwork>
+        <LogicFile filepath="unmarked_village_road.xodr"/>
+    </RoadNetwork>
+    <Entities>
+        <ScenarioObject name="EgoVehicle">
+            <Vehicle name="Ego_Electric_Sedan" vehicleCategory="car">
+                <ParameterDeclarations/>
+                <Performance maxSpeed="30.0" maxAcceleration="3.5" maxDeceleration="7.0"/>
+                <BoundingBox>
+                    <Center x="1.4" y="0.0" z="0.75"/>
+                    <Dimension width="1.8" length="4.5" height="1.5"/>
+                </BoundingBox>
+                <Axles>
+                    <FrontAxle maxSteering="0.785" wheelDiameter="0.65" trackWidth="1.6" positionX="2.7" positionZ="0.325"/>
+                    <RearAxle maxSteering="0.0" wheelDiameter="0.65" trackWidth="1.6" positionX="0.0" positionZ="0.325"/>
+                </Axles>
+                <Properties/>
+            </Vehicle>
+        </ScenarioObject>
+        <ScenarioObject name="OncomingTractor">
+            <Vehicle name="Mahindra_Tractor" vehicleCategory="truck">
+                <ParameterDeclarations/>
+                <Performance maxSpeed="8.0" maxAcceleration="1.5" maxDeceleration="4.0"/>
+                <BoundingBox>
+                    <Center x="1.8" y="0.0" z="1.1"/>
+                    <Dimension width="2.0" length="4.2" height="2.3"/>
+                </BoundingBox>
+                <Axles>
+                    <FrontAxle maxSteering="0.6" wheelDiameter="0.8" trackWidth="1.7" positionX="2.5" positionZ="0.4"/>
+                    <RearAxle maxSteering="0.0" wheelDiameter="1.4" trackWidth="1.7" positionX="0.0" positionZ="0.7"/>
+                </Axles>
+                <Properties/>
+            </Vehicle>
+        </ScenarioObject>
+        <ScenarioObject name="CrossingPedestrian">
+            <Pedestrian model="adult" mass="70.0" name="Village_Pedestrian" pedestrianCategory="pedestrian">
+                <ParameterDeclarations/>
+                <BoundingBox>
+                    <Center x="0.0" y="0.0" z="0.85"/>
+                    <Dimension width="0.5" length="0.5" height="1.7"/>
+                </BoundingBox>
+                <Properties/>
+            </Pedestrian>
+        </ScenarioObject>
+    </Entities>
+    <Storyboard>
+        <Init>
+            <Actions>
+                <Private entityRef="EgoVehicle">
+                    <PrivateAction>
+                        <TeleportAction>
+                            <Position>
+                                <WorldPosition x="0.0" y="0.0" z="0.0" h="0.0"/>
+                            </Position>
+                        </TeleportAction>
+                    </PrivateAction>
+                    <PrivateAction>
+                        <LongitudinalAction>
+                            <SpeedAction>
+                                <SpeedActionDynamics dynamicsShape="step" value="0.0" dynamicsDimension="time"/>
+                                <SpeedActionTarget>
+                                    <AbsoluteTargetSpeed value="0.0"/>
+                                </SpeedActionTarget>
+                            </SpeedAction>
+                        </LongitudinalAction>
+                    </PrivateAction>
+                </Private>
+                <Private entityRef="OncomingTractor">
+                    <PrivateAction>
+                        <TeleportAction>
+                            <Position>
+                                <WorldPosition x="140.0" y="1.1" z="0.0" h="3.14159"/>
+                            </Position>
+                        </TeleportAction>
+                    </PrivateAction>
+                    <PrivateAction>
+                        <LongitudinalAction>
+                            <SpeedAction>
+                                <SpeedActionDynamics dynamicsShape="linear" value="2.0" dynamicsDimension="time"/>
+                                <SpeedActionTarget>
+                                    <AbsoluteTargetSpeed value="4.0"/>
+                                </SpeedActionTarget>
+                            </SpeedAction>
+                        </LongitudinalAction>
+                    </PrivateAction>
+                </Private>
+                <Private entityRef="CrossingPedestrian">
+                    <PrivateAction>
+                        <TeleportAction>
+                            <Position>
+                                <WorldPosition x="55.0" y="3.2" z="0.0" h="-1.5708"/>
+                            </Position>
+                        </TeleportAction>
+                    </PrivateAction>
+                </Private>
+            </Actions>
+        </Init>
+    </Storyboard>
+</OpenSCENARIO>

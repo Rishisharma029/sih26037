@@ -1,6 +1,6 @@
 """Benchmark 4: High-Density Pedestrian & Pushcart Market Street."""
 from interfaces import Point3D, Vector3D, ObstacleClass
-from simulation.environment import ObstacleDefinition
+from simulation.actors import SimulationActor
 from .scenario_base import BaseScenario
 
 class DenseMarketScenario(BaseScenario):
@@ -8,13 +8,17 @@ class DenseMarketScenario(BaseScenario):
         super().__init__(name="Dense Market Street", duration_seconds=15.0)
 
     def setup_environment(self):
-        self.env.road_width_m = 5.0
+        self.env.geometry.length_m = 100.0
         # Vegetable pushcart stationary in corridor
-        self.env.add_obstacle(ObstacleDefinition(
+        self.env.add_actor(SimulationActor(
             id="vendor_cart",
             obstacle_class=ObstacleClass.PUSHCART,
-            position=Point3D(x=18.0, y=-1.0, z=0.5),
-            size=Vector3D(x=1.8, y=1.1, z=1.2),
+            x=18.0,
+            y=-1.0,
+            z=0.0,
+            length_m=1.8,
+            width_m=1.1,
+            height_m=1.2,
             speed_mps=0.0,
             is_static=True
         ))

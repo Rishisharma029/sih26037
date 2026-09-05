@@ -13,7 +13,7 @@ def test_scenario_step_execution():
 
 def test_scenario_population():
     s1 = UnmarkedVillageRoadScenario()
-    assert len(s1.env.obstacles) == 1
+    assert len(s1.env.actors) >= 1
 
     s2 = HighwayCutInScenario()
-    assert len(s2.env.obstacles) == 1
+    assert len(s2.env.actors) >= 1

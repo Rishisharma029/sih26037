@@ -14,9 +14,9 @@ class SyntheticSensorSuite:
         return RawSensorFrame(
             timestamp=ego_state.timestamp,
             frame_id=self.frame_id,
-            lidar_points_count=len(self.env.obstacles) * 45 + 120,
-            camera_detections_count=len(self.env.obstacles),
-            radar_targets_count=len([o for o in self.env.obstacles if not o.is_static]),
+            lidar_points_count=len(self.env.actors) * 45 + 120,
+            camera_detections_count=len(self.env.actors),
+            radar_targets_count=len([o for o in self.env.actors if not o.is_static]),
             gnss_fix=True,
             imu_angular_velocity=ego_state.twist.angular,
             imu_linear_acceleration=ego_state.acceleration
