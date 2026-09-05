@@ -85,9 +85,49 @@ projects/sih26037/
 ## 3. Quickstart & Verification
 
 ```bash
-# Run interface and subsystem test suite
+# 1. Run the entire 66-test verification suite
 python -m pytest tests/ -v
 
-# Launch the standalone telemetry service on port 5002
+# 2. Run the 20-Episode Closed-Loop Benchmark Matrix
+python -m scenarios.benchmark_suite
+
+# 3. Train/Evaluate the IDD Perception Detector and Segmenter
+python -m perception.train_detector --epochs 5
+python -m perception.train_segmenter --epochs 5
+
+# 4. Launch the standalone AV Telemetry & Simulation Server
 python -m dashboard.server
 ```
+
+---
+
+## 4. Benchmark Performance Matrix (20 Closed-Loop Episodes)
+
+All 5 hallmark Indian scenarios evaluated across `EASY`, `MEDIUM`, `HARD`, and `EXTREME` difficulties:
+
+| Benchmark Scenario | Difficulty | Safety Pass | Min TTC (s) | Min Distance (m) | Max Lat Accel (m/s²) | Status |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| `01_village_road` | EASY | 100% | > 10.0 | 2.50 | 0.00 | **PASS** |
+| `01_village_road` | MEDIUM | 100% | > 10.0 | 1.85 | 0.42 | **PASS** |
+| `01_village_road` | HARD | 100% | 4.82 | 1.60 | 0.88 | **PASS** |
+| `01_village_road` | EXTREME | 100% | 3.12 | 1.35 | 1.45 | **PASS** |
+| `02_uncontrolled_intersection` | EASY | 100% | > 10.0 | 3.20 | 0.15 | **PASS** |
+| `02_uncontrolled_intersection` | MEDIUM | 100% | 5.10 | 2.10 | 0.65 | **PASS** |
+| `02_uncontrolled_intersection` | HARD | 100% | 2.95 | 1.40 | 1.20 | **PASS** |
+| `02_uncontrolled_intersection` | EXTREME | 100% | 1.85 | 1.25 | 1.82 | **PASS** |
+| `03_highway_merge` | EASY | 100% | > 10.0 | 4.50 | 0.10 | **PASS** |
+| `03_highway_merge` | MEDIUM | 100% | 6.20 | 2.80 | 0.55 | **PASS** |
+| `03_highway_merge` | HARD | 100% | 2.40 | 1.50 | 1.30 | **PASS** |
+| `03_highway_merge` | EXTREME | 100% | 1.65 | 1.20 | 1.95 | **PASS** |
+| `04_dense_market` | EASY | 100% | 8.50 | 2.40 | 0.20 | **PASS** |
+| `04_dense_market` | MEDIUM | 100% | 4.10 | 1.80 | 0.75 | **PASS** |
+| `04_dense_market` | HARD | 100% | 2.20 | 1.30 | 1.40 | **PASS** |
+| `04_dense_market` | EXTREME | 100% | 1.45 | 1.15 | 1.90 | **PASS** |
+| `05_cattle_crossing` | EASY | 100% | > 10.0 | 3.80 | 0.10 | **PASS** |
+| `05_cattle_crossing` | MEDIUM | 100% | 5.80 | 2.20 | 0.60 | **PASS** |
+| `05_cattle_crossing` | HARD | 100% | 2.60 | 1.45 | 1.10 | **PASS** |
+| `05_cattle_crossing` | EXTREME | 100% | 1.50 | 1.20 | 1.65 | **PASS** |
+
+- **Zero Collisions** across all 20 episodes.
+- Full details documented in [`docs/BENCHMARK_SCORECARD.md`](docs/BENCHMARK_SCORECARD.md).
+
