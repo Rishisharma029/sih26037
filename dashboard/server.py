@@ -21,13 +21,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from interfaces import (
     VehicleTelemetry, Pose3D, Twist3D, BehaviorMode,
     SafetyAction, ControlCommand, SafeTrajectory, TrajectoryPoint,
-    Point3D, Vector3D, GearMode
+    Point3D, Vector3D, GearMode, PerceptionOutput, FreeSpaceCorridor,
+    TrackedObstacle, BoundingBox3D
 )
 from scenarios.scenario_unmarked_village import UnmarkedVillageRoadScenario
 from vehicle_control.lateral_controller import StanleyLateralController
 from vehicle_control.longitudinal_controller import LongitudinalPIDController
 from collision_avoidance.emergency_brake import EmergencyBrakeSupervisory
 from perception.boundary_detector import FreeSpaceBoundaryDetector
+from prediction.trajectory_predictor import TrajectoryPredictor
 
 class SimulationEngineState:
     def __init__(self):
@@ -35,6 +37,7 @@ class SimulationEngineState:
         self.lat_ctrl = StanleyLateralController(k_gain=1.4)
         self.lon_ctrl = LongitudinalPIDController(kp=22.0, ki=0.5, kd=2.0)
         self.supervisory = EmergencyBrakeSupervisory(aeb_ttc_threshold_s=0.85)
+        self.predictor = TrajectoryPredictor(horizon_seconds=3.0, dt=0.5, mode="ensemble")
         self.is_running = True
         self.target_speed_mps = 6.0
         self.is_emergency_stop = False
@@ -107,10 +110,29 @@ class SimulationEngineState:
         margin = min(margin_left, margin_right)
         self.min_corridor_margin = min(self.min_corridor_margin, margin)
 
-        # 5. Actors list for visualizer
+        # 5. Actors list & Multi-Modal Prediction for visualizer
         actors_data = []
+        obstacles = []
         for a in self.scenario.env.actors:
             rel_dx = a.x - state.pose.position.x
+            rel_dy = a.y - state.pose.position.y
+            vx = a.speed_mps * math.cos(a.yaw_rad)
+            vy = a.speed_mps * math.sin(a.yaw_rad)
+            
+            obs = TrackedObstacle(
+                id=a.id,
+                obstacle_class=a.obstacle_class,
+                confidence=0.95,
+                bbox=BoundingBox3D(
+                    center=Point3D(x=a.x, y=a.y, z=0.5),
+                    size=Vector3D(x=a.length_m, y=a.width_m, z=1.5),
+                    yaw_rad=a.yaw_rad
+                ),
+                velocity=Vector3D(x=vx, y=vy, z=0.0),
+                distance_m=math.hypot(rel_dx, rel_dy),
+                is_static=a.is_static
+            )
+            obstacles.append(obs)
             actors_data.append({
                 "id": a.id,
                 "class": a.obstacle_class.value,
@@ -120,6 +142,45 @@ class SimulationEngineState:
                 "yaw_deg": round(math.degrees(a.yaw_rad), 1),
                 "rel_dx": round(rel_dx, 2),
                 "is_static": a.is_static
+            })
+
+        # Run Phase 5 Motion Prediction
+        perception_frame = PerceptionOutput(
+            timestamp=state.timestamp,
+            frame_id=self.step_count,
+            obstacles=obstacles,
+            drivable_corridor=FreeSpaceCorridor(
+                timestamp=state.timestamp,
+                boundary_points=[],
+                average_width_m=float(d_left - d_right)
+            )
+        )
+        pred_out = self.predictor.predict(perception_frame, ego_speed=state.twist.speed_mps)
+
+        predictions_data = []
+        for agent in pred_out.agents:
+            trajs_data = []
+            for t in agent.trajectories:
+                trajs_data.append({
+                    "mode_name": t.mode_name,
+                    "probability": round(t.probability, 2),
+                    "collision_risk": round(t.collision_risk, 2),
+                    "waypoints": [
+                        {
+                            "x": round(pt.position.x, 2),
+                            "y": round(pt.position.y, 2),
+                            "sigma_x": round(pt.sigma_x, 2),
+                            "sigma_y": round(pt.sigma_y, 2)
+                        }
+                        for pt in t.waypoints
+                    ]
+                })
+            predictions_data.append({
+                "id": agent.id,
+                "class": agent.obstacle_class.value,
+                "intent": agent.primary_intent.value,
+                "is_high_risk": agent.is_high_risk,
+                "trajectories": trajs_data
             })
 
         self.latest_telemetry = {
@@ -147,7 +208,9 @@ class SimulationEngineState:
                 "is_e_stop": self.is_emergency_stop,
                 "target_speed_kph": round(self.target_speed_mps * 3.6, 1)
             },
-            "actors": actors_data
+            "actors": actors_data,
+            "predictions": predictions_data,
+            "high_risk_agent_ids": pred_out.high_risk_agent_ids
         }
 
 sim_engine = SimulationEngineState()

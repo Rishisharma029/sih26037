@@ -206,12 +206,16 @@ class PredictedTrajectoryPoint(BaseModel):
     position: Point3D
     velocity: Vector3D
     yaw_rad: float
+    sigma_x: float = Field(0.0, description="1-sigma longitudinal spatial uncertainty (m)")
+    sigma_y: float = Field(0.0, description="1-sigma lateral spatial uncertainty (m)")
 
 
 class PredictedTrajectory(BaseModel):
     """A single predicted future path option with probability."""
     model_config = ConfigDict(extra="forbid")
     probability: float = Field(..., ge=0.0, le=1.0)
+    mode_name: str = Field("continuation", description="Modal identifier (e.g. continue, nudge, cut_in, stall)")
+    collision_risk: float = Field(0.0, ge=0.0, le=1.0, description="Estimated collision risk score [0, 1]")
     waypoints: List[PredictedTrajectoryPoint] = Field(default_factory=list)
 
 
