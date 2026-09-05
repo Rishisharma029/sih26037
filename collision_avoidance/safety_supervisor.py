@@ -31,6 +31,9 @@ class SafetySupervisoryLayer:
             critical_threshold_s=aeb_ttc_threshold_s
         )
         self.cbf_filter = ControlBarrierFilter(min_safe_dist_m=min_barrier_dist_m)
+        self.min_barrier_dist_m = min_barrier_dist_m
+        self.aeb_trigger_count = 0
+        self.emergency_replan_count = 0
 
     def supervise(
         self,
@@ -60,6 +63,7 @@ class SafetySupervisoryLayer:
 
         # Priority 1: Critical TTC or Imminent Impact -> Autonomous Emergency Braking (AEB)
         if risk.min_ttc_seconds < self.aeb_ttc_threshold_s:
+            self.aeb_trigger_count += 1
             safety_action = SafetyAction.EMERGENCY_BRAKE
             is_e_stop = True
             replan_recommended = False
@@ -70,6 +74,7 @@ class SafetySupervisoryLayer:
 
         # Priority 2: Unexpected Dynamic Obstacle Incursion -> Emergency Re-plan
         elif unexpected_incursion:
+            self.emergency_replan_count += 1
             safety_action = SafetyAction.EMERGENCY_REPLAN
             replan_recommended = True
             safety_status_reason = f"UNEXPECTED_OBSTACLE_INCURSION ({incursion_id}) -> EMERGENCY_REPLAN"

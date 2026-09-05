@@ -59,10 +59,13 @@ class ClosedLoopAutonomyPipeline:
     def __init__(
         self,
         environment: Optional[SimulationEnvironment] = None,
+        planner: Optional[Any] = None,
         target_cruise_speed_mps: float = 6.0,
-        dt: float = 0.05
+        dt: float = 0.05,
+        plan_dt: float = 0.20
     ):
         self.dt = dt
+        self.plan_dt = plan_dt
         self.target_cruise_speed_mps = target_cruise_speed_mps
 
         # Simulation & Dynamics
@@ -77,8 +80,9 @@ class ClosedLoopAutonomyPipeline:
         self.fusion = PerceptionFusion()
         self.world_model = WorldModel(timestamp=0.0)
         self.predictor = TrajectoryPredictor(horizon_seconds=3.0, dt=0.2, mode="ensemble")
-        self.planner = AdaptiveLatticePlanner(horizon_seconds=3.0, dt=0.2)
+        self.planner = planner if planner is not None else AdaptiveLatticePlanner(horizon_seconds=3.0, dt=plan_dt)
         self.safety_layer = SafetySupervisoryLayer(aeb_ttc_threshold_s=0.85)
+        self.safety_supervisor = self.safety_layer
         self.dbw_bridge = DriveByWireBridge()
 
         # State
@@ -86,7 +90,7 @@ class ClosedLoopAutonomyPipeline:
         self.current_plan: Optional[PlannedTrajectory] = None
         self.current_safe_plan: Optional[SafeTrajectory] = None
         self.latest_command: Optional[ControlCommand] = None
-        self.plan_replan_interval_steps = 4 # Re-plan at 5 Hz (every 4 steps of 0.05s = 0.2s)
+        self.plan_replan_interval_steps = max(1, int(plan_dt / dt)) # Re-plan at desired interval
 
     def run_step(self) -> Tuple[EgoVehicleState, SafeTrajectory, ControlCommand, Dict[str, Any]]:
         """Executes a single closed-loop autonomy step."""
@@ -194,8 +198,24 @@ class ClosedLoopAutonomyPipeline:
             "corridor_margin_m": self.metrics.min_corridor_margin_m,
             "rms_cte_m": self.metrics.rms_crosstrack_error_m
         }
-
         return new_ego_state, self.current_safe_plan, self.latest_command, telemetry_frame
+
+    def step(self) -> Dict[str, Any]:
+        """Convenience method returning dictionary with ego_state and safety_status."""
+        ego_state, safe_plan, cmd, telemetry = self.run_step()
+        min_clear = self.metrics.min_obstacle_clearance_m
+        min_ttc = safe_plan.min_ttc_seconds if safe_plan else 10.0
+        return {
+            "ego_state": ego_state,
+            "safe_plan": safe_plan,
+            "command": cmd,
+            "telemetry": telemetry,
+            "safety_status": {
+                "min_clearance_m": min_clear if min_clear < 900.0 else 10.0,
+                "min_ttc_s": min_ttc if min_ttc < 900.0 else 10.0,
+                "is_safe": safe_plan.safety_action == SafetyAction.NONE if safe_plan else True
+            }
+        }
 
     def _update_metrics(
         self,
