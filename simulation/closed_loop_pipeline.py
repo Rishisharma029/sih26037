@@ -84,11 +84,17 @@ class ClosedLoopAutonomyPipeline:
         self.safety_layer = SafetySupervisoryLayer(aeb_ttc_threshold_s=0.85)
         self.safety_supervisor = self.safety_layer
         self.dbw_bridge = DriveByWireBridge()
+        # Explainability & Resilience
+        from explainability.flight_recorder import FlightRecorder
+        from hardening.fallback_manager import FallbackManager
+        self.flight_recorder = FlightRecorder(scenario_name="Unstructured Indian Corridor")
+        self.fallback_manager = FallbackManager()
 
         # State
         self.metrics = ClosedLoopMetrics()
         self.current_plan: Optional[PlannedTrajectory] = None
         self.current_safe_plan: Optional[SafeTrajectory] = None
+        self.latest_decision_event = None
         self.latest_command: Optional[ControlCommand] = None
         self.plan_replan_interval_steps = max(1, int(plan_dt / dt)) # Re-plan at desired interval
 
@@ -171,17 +177,35 @@ class ClosedLoopAutonomyPipeline:
                 prediction=prediction
             )
 
-        # 5. VEHICLE CONTROL: Drive-by-wire steering & longitudinal command
+        # 5. HARDENING & RESILIENCE FALLBACK CHECK
+        self.current_safe_plan, fallback_active, fallback_reason = self.fallback_manager.evaluate_and_apply_fallback(
+            ego_state=ego_state,
+            perception=perception,
+            safe_plan=self.current_safe_plan
+        )
+
+        # 6. EXPLAINABILITY & FLIGHT RECORDER LOGGING
+        candidate_scores = getattr(self.planner, "last_candidate_scores", None)
+        self.latest_decision_event = self.flight_recorder.record_decision(
+            ego_state=ego_state,
+            perception=perception,
+            prediction=prediction,
+            planned=self.current_plan,
+            safe_plan=self.current_safe_plan,
+            candidate_scores=candidate_scores
+        )
+
+        # 7. VEHICLE CONTROL: Drive-by-wire steering & longitudinal command
         self.latest_command = self.dbw_bridge.generate_command(
             ego_state=ego_state,
             trajectory=self.current_safe_plan,
             dt=self.dt
         )
 
-        # 6. ACTUATION & DYNAMICS: Step physical simulation
+        # 8. ACTUATION & DYNAMICS: Step physical simulation
         new_ego_state, raw_sensor_dict = self.env.step(self.latest_command)
 
-        # 7. METRICS & TELEMETRY
+        # 9. METRICS & TELEMETRY
         self._update_metrics(new_ego_state, d_left, d_right, obstacles)
 
         telemetry_frame = {
@@ -196,7 +220,14 @@ class ClosedLoopAutonomyPipeline:
             "safety_action": self.current_safe_plan.safety_action.value,
             "min_ttc_s": self.current_safe_plan.min_ttc_seconds,
             "corridor_margin_m": self.metrics.min_corridor_margin_m,
-            "rms_cte_m": self.metrics.rms_crosstrack_error_m
+            "rms_cte_m": self.metrics.rms_crosstrack_error_m,
+            "explainability": {
+                "event_id": self.latest_decision_event.event_id,
+                "hazard": self.latest_decision_event.hazard.hazard_type,
+                "risk": self.latest_decision_event.risk_level.value,
+                "reason": self.latest_decision_event.rationale.primary_reason,
+                "card": self.latest_decision_event.format_event_card()
+            }
         }
         return new_ego_state, self.current_safe_plan, self.latest_command, telemetry_frame
 
