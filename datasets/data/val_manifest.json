@@ -1,0 +1,272 @@
+[
+  {
+    "image_id": "idd_val_0000",
+    "file_path": "val\\images\\idd_val_0000.png",
+    "width": 640,
+    "height": 360,
+    "boxes": [
+      {
+        "xmin": 249.0,
+        "ymin": 199.0,
+        "xmax": 291.0,
+        "ymax": 265.0,
+        "label": "pedestrian",
+        "confidence": 1.0
+      },
+      {
+        "xmin": 339.0,
+        "ymin": 240.0,
+        "xmax": 379.0,
+        "ymax": 291.0,
+        "label": "car",
+        "confidence": 1.0
+      }
+    ],
+    "segmentation_mask_path": "val\\masks\\idd_val_0000_mask.png",
+    "weather": "clear",
+    "road_type": "rural_village"
+  },
+  {
+    "image_id": "idd_val_0001",
+    "file_path": "val\\images\\idd_val_0001.png",
+    "width": 640,
+    "height": 360,
+    "boxes": [
+      {
+        "xmin": 162.0,
+        "ymin": 222.0,
+        "xmax": 218.0,
+        "ymax": 267.0,
+        "label": "motorcycle",
+        "confidence": 1.0
+      }
+    ],
+    "segmentation_mask_path": "val\\masks\\idd_val_0001_mask.png",
+    "weather": "clear",
+    "road_type": "rural_village"
+  },
+  {
+    "image_id": "idd_val_0002",
+    "file_path": "val\\images\\idd_val_0002.png",
+    "width": 640,
+    "height": 360,
+    "boxes": [
+      {
+        "xmin": 208.0,
+        "ymin": 235.0,
+        "xmax": 259.0,
+        "ymax": 284.0,
+        "label": "truck",
+        "confidence": 1.0
+      }
+    ],
+    "segmentation_mask_path": "val\\masks\\idd_val_0002_mask.png",
+    "weather": "clear",
+    "road_type": "rural_village"
+  },
+  {
+    "image_id": "idd_val_0003",
+    "file_path": "val\\images\\idd_val_0003.png",
+    "width": 640,
+    "height": 360,
+    "boxes": [
+      {
+        "xmin": 420.0,
+        "ymin": 297.0,
+        "xmax": 467.0,
+        "ymax": 359.0,
+        "label": "bicycle",
+        "confidence": 1.0
+      },
+      {
+        "xmin": 371.0,
+        "ymin": 297.0,
+        "xmax": 441.0,
+        "ymax": 359.0,
+        "label": "animal",
+        "confidence": 1.0
+      },
+      {
+        "xmin": 440.0,
+        "ymin": 281.0,
+        "xmax": 501.0,
+        "ymax": 356.0,
+        "label": "autorickshaw",
+        "confidence": 1.0
+      }
+    ],
+    "segmentation_mask_path": "val\\masks\\idd_val_0003_mask.png",
+    "weather": "clear",
+    "road_type": "rural_village"
+  },
+  {
+    "image_id": "idd_val_0004",
+    "file_path": "val\\images\\idd_val_0004.png",
+    "width": 640,
+    "height": 360,
+    "boxes": [
+      {
+        "xmin": 338.0,
+        "ymin": 214.0,
+        "xmax": 386.0,
+        "ymax": 274.0,
+        "label": "bus",
+        "confidence": 1.0
+      },
+      {
+        "xmin": 223.0,
+        "ymin": 214.0,
+        "xmax": 263.0,
+        "ymax": 280.0,
+        "label": "animal",
+        "confidence": 1.0
+      },
+      {
+        "xmin": 264.0,
+        "ymin": 208.0,
+        "xmax": 309.0,
+        "ymax": 248.0,
+        "label": "autorickshaw",
+        "confidence": 1.0
+      }
+    ],
+    "segmentation_mask_path": "val\\masks\\idd_val_0004_mask.png",
+    "weather": "clear",
+    "road_type": "rural_village"
+  },
+  {
+    "image_id": "idd_val_0005",
+    "file_path": "val\\images\\idd_val_0005.png",
+    "width": 640,
+    "height": 360,
+    "boxes": [
+      {
+        "xmin": 201.0,
+        "ymin": 235.0,
+        "xmax": 251.0,
+        "ymax": 307.0,
+        "label": "motorcycle",
+        "confidence": 1.0
+      },
+      {
+        "xmin": 359.0,
+        "ymin": 280.0,
+        "xmax": 396.0,
+        "ymax": 344.0,
+        "label": "truck",
+        "confidence": 1.0
+      },
+      {
+        "xmin": 166.0,
+        "ymin": 274.0,
+        "xmax": 222.0,
+        "ymax": 343.0,
+        "label": "autorickshaw",
+        "confidence": 1.0
+      }
+    ],
+    "segmentation_mask_path": "val\\masks\\idd_val_0005_mask.png",
+    "weather": "clear",
+    "road_type": "rural_village"
+  },
+  {
+    "image_id": "idd_val_0006",
+    "file_path": "val\\images\\idd_val_0006.png",
+    "width": 640,
+    "height": 360,
+    "boxes": [
+      {
+        "xmin": 309.0,
+        "ymin": 273.0,
+        "xmax": 371.0,
+        "ymax": 323.0,
+        "label": "car",
+        "confidence": 1.0
+      }
+    ],
+    "segmentation_mask_path": "val\\masks\\idd_val_0006_mask.png",
+    "weather": "clear",
+    "road_type": "rural_village"
+  },
+  {
+    "image_id": "idd_val_0007",
+    "file_path": "val\\images\\idd_val_0007.png",
+    "width": 640,
+    "height": 360,
+    "boxes": [
+      {
+        "xmin": 413.0,
+        "ymin": 234.0,
+        "xmax": 471.0,
+        "ymax": 279.0,
+        "label": "bicycle",
+        "confidence": 1.0
+      },
+      {
+        "xmin": 263.0,
+        "ymin": 214.0,
+        "xmax": 324.0,
+        "ymax": 264.0,
+        "label": "bus",
+        "confidence": 1.0
+      },
+      {
+        "xmin": 307.0,
+        "ymin": 190.0,
+        "xmax": 371.0,
+        "ymax": 246.0,
+        "label": "animal",
+        "confidence": 1.0
+      }
+    ],
+    "segmentation_mask_path": "val\\masks\\idd_val_0007_mask.png",
+    "weather": "clear",
+    "road_type": "rural_village"
+  },
+  {
+    "image_id": "idd_val_0008",
+    "file_path": "val\\images\\idd_val_0008.png",
+    "width": 640,
+    "height": 360,
+    "boxes": [
+      {
+        "xmin": 422.0,
+        "ymin": 282.0,
+        "xmax": 469.0,
+        "ymax": 353.0,
+        "label": "bus",
+        "confidence": 1.0
+      },
+      {
+        "xmin": 177.0,
+        "ymin": 243.0,
+        "xmax": 212.0,
+        "ymax": 293.0,
+        "label": "car",
+        "confidence": 1.0
+      }
+    ],
+    "segmentation_mask_path": "val\\masks\\idd_val_0008_mask.png",
+    "weather": "clear",
+    "road_type": "rural_village"
+  },
+  {
+    "image_id": "idd_val_0009",
+    "file_path": "val\\images\\idd_val_0009.png",
+    "width": 640,
+    "height": 360,
+    "boxes": [
+      {
+        "xmin": 175.0,
+        "ymin": 291.0,
+        "xmax": 234.0,
+        "ymax": 332.0,
+        "label": "bus",
+        "confidence": 1.0
+      }
+    ],
+    "segmentation_mask_path": "val\\masks\\idd_val_0009_mask.png",
+    "weather": "clear",
+    "road_type": "rural_village"
+  }
+]

@@ -1,0 +1,27 @@
+{
+  "image_id": "idd_test_0008",
+  "file_path": "test\\images\\idd_test_0008.png",
+  "width": 640,
+  "height": 360,
+  "boxes": [
+    {
+      "xmin": 176.0,
+      "ymin": 278.0,
+      "xmax": 240.0,
+      "ymax": 354.0,
+      "label": "bicycle",
+      "confidence": 1.0
+    },
+    {
+      "xmin": 333.0,
+      "ymin": 266.0,
+      "xmax": 371.0,
+      "ymax": 321.0,
+      "label": "pedestrian",
+      "confidence": 1.0
+    }
+  ],
+  "segmentation_mask_path": "test\\masks\\idd_test_0008_mask.png",
+  "weather": "clear",
+  "road_type": "rural_village"
+}

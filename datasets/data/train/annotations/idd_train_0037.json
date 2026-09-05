@@ -1,0 +1,35 @@
+{
+  "image_id": "idd_train_0037",
+  "file_path": "train\\images\\idd_train_0037.png",
+  "width": 640,
+  "height": 360,
+  "boxes": [
+    {
+      "xmin": 324.0,
+      "ymin": 292.0,
+      "xmax": 370.0,
+      "ymax": 359.0,
+      "label": "pedestrian",
+      "confidence": 1.0
+    },
+    {
+      "xmin": 231.0,
+      "ymin": 254.0,
+      "xmax": 299.0,
+      "ymax": 319.0,
+      "label": "animal",
+      "confidence": 1.0
+    },
+    {
+      "xmin": 172.0,
+      "ymin": 264.0,
+      "xmax": 241.0,
+      "ymax": 317.0,
+      "label": "truck",
+      "confidence": 1.0
+    }
+  ],
+  "segmentation_mask_path": "train\\masks\\idd_train_0037_mask.png",
+  "weather": "clear",
+  "road_type": "rural_village"
+}

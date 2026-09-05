@@ -1,0 +1,27 @@
+{
+  "image_id": "idd_test_0001",
+  "file_path": "test\\images\\idd_test_0001.png",
+  "width": 640,
+  "height": 360,
+  "boxes": [
+    {
+      "xmin": 379.0,
+      "ymin": 233.0,
+      "xmax": 427.0,
+      "ymax": 277.0,
+      "label": "car",
+      "confidence": 1.0
+    },
+    {
+      "xmin": 187.0,
+      "ymin": 223.0,
+      "xmax": 234.0,
+      "ymax": 280.0,
+      "label": "autorickshaw",
+      "confidence": 1.0
+    }
+  ],
+  "segmentation_mask_path": "test\\masks\\idd_test_0001_mask.png",
+  "weather": "clear",
+  "road_type": "rural_village"
+}

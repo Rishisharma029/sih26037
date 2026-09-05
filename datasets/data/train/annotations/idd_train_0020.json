@@ -1,0 +1,19 @@
+{
+  "image_id": "idd_train_0020",
+  "file_path": "train\\images\\idd_train_0020.png",
+  "width": 640,
+  "height": 360,
+  "boxes": [
+    {
+      "xmin": 353.0,
+      "ymin": 191.0,
+      "xmax": 392.0,
+      "ymax": 252.0,
+      "label": "bus",
+      "confidence": 1.0
+    }
+  ],
+  "segmentation_mask_path": "train\\masks\\idd_train_0020_mask.png",
+  "weather": "clear",
+  "road_type": "rural_village"
+}

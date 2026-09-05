@@ -1,0 +1,19 @@
+{
+  "image_id": "idd_test_0005",
+  "file_path": "test\\images\\idd_test_0005.png",
+  "width": 640,
+  "height": 360,
+  "boxes": [
+    {
+      "xmin": 167.0,
+      "ymin": 254.0,
+      "xmax": 205.0,
+      "ymax": 306.0,
+      "label": "truck",
+      "confidence": 1.0
+    }
+  ],
+  "segmentation_mask_path": "test\\masks\\idd_test_0005_mask.png",
+  "weather": "clear",
+  "road_type": "rural_village"
+}

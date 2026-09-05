@@ -1,0 +1,19 @@
+{
+  "image_id": "idd_val_0006",
+  "file_path": "val\\images\\idd_val_0006.png",
+  "width": 640,
+  "height": 360,
+  "boxes": [
+    {
+      "xmin": 309.0,
+      "ymin": 273.0,
+      "xmax": 371.0,
+      "ymax": 323.0,
+      "label": "car",
+      "confidence": 1.0
+    }
+  ],
+  "segmentation_mask_path": "val\\masks\\idd_val_0006_mask.png",
+  "weather": "clear",
+  "road_type": "rural_village"
+}

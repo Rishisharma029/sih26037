@@ -1,0 +1,35 @@
+{
+  "image_id": "idd_test_0002",
+  "file_path": "test\\images\\idd_test_0002.png",
+  "width": 640,
+  "height": 360,
+  "boxes": [
+    {
+      "xmin": 369.0,
+      "ymin": 225.0,
+      "xmax": 407.0,
+      "ymax": 304.0,
+      "label": "animal",
+      "confidence": 1.0
+    },
+    {
+      "xmin": 379.0,
+      "ymin": 251.0,
+      "xmax": 444.0,
+      "ymax": 293.0,
+      "label": "bicycle",
+      "confidence": 1.0
+    },
+    {
+      "xmin": 229.0,
+      "ymin": 213.0,
+      "xmax": 271.0,
+      "ymax": 287.0,
+      "label": "truck",
+      "confidence": 1.0
+    }
+  ],
+  "segmentation_mask_path": "test\\masks\\idd_test_0002_mask.png",
+  "weather": "clear",
+  "road_type": "rural_village"
+}

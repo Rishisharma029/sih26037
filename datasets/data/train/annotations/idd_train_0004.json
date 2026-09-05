@@ -1,0 +1,27 @@
+{
+  "image_id": "idd_train_0004",
+  "file_path": "train\\images\\idd_train_0004.png",
+  "width": 640,
+  "height": 360,
+  "boxes": [
+    {
+      "xmin": 191.0,
+      "ymin": 203.0,
+      "xmax": 227.0,
+      "ymax": 267.0,
+      "label": "bicycle",
+      "confidence": 1.0
+    },
+    {
+      "xmin": 294.0,
+      "ymin": 251.0,
+      "xmax": 356.0,
+      "ymax": 327.0,
+      "label": "bicycle",
+      "confidence": 1.0
+    }
+  ],
+  "segmentation_mask_path": "train\\masks\\idd_train_0004_mask.png",
+  "weather": "clear",
+  "road_type": "rural_village"
+}

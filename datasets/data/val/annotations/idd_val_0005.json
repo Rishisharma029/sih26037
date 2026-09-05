@@ -1,0 +1,35 @@
+{
+  "image_id": "idd_val_0005",
+  "file_path": "val\\images\\idd_val_0005.png",
+  "width": 640,
+  "height": 360,
+  "boxes": [
+    {
+      "xmin": 201.0,
+      "ymin": 235.0,
+      "xmax": 251.0,
+      "ymax": 307.0,
+      "label": "motorcycle",
+      "confidence": 1.0
+    },
+    {
+      "xmin": 359.0,
+      "ymin": 280.0,
+      "xmax": 396.0,
+      "ymax": 344.0,
+      "label": "truck",
+      "confidence": 1.0
+    },
+    {
+      "xmin": 166.0,
+      "ymin": 274.0,
+      "xmax": 222.0,
+      "ymax": 343.0,
+      "label": "autorickshaw",
+      "confidence": 1.0
+    }
+  ],
+  "segmentation_mask_path": "val\\masks\\idd_val_0005_mask.png",
+  "weather": "clear",
+  "road_type": "rural_village"
+}
