@@ -145,3 +145,6 @@ class MultiSensorKalmanFusion:
             anomalies=[],
             sensor_health={"camera": True, "lidar": True, "radar": True, "gnss": raw.gnss_fix}
         )
+
+# Aliases
+PerceptionFusion = MultiSensorKalmanFusion
