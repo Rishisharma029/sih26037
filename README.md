@@ -85,17 +85,23 @@ projects/sih26037/
 ## 3. Quickstart & Verification
 
 ```bash
-# 1. Run the entire 66-test verification suite
+# 1. Run the entire 75-test verification suite
 python -m pytest tests/ -v
 
 # 2. Run the 20-Episode Closed-Loop Benchmark Matrix
 python -m scenarios.benchmark_suite
 
-# 3. Train/Evaluate the IDD Perception Detector and Segmenter
+# 3. Run the Head-to-Head Comparative Benchmark (Baseline vs Adaptive)
+python -m evaluation.comparative_evaluator
+
+# 4. Run the Adversarial Hardening Stress Suite (10 Edge Cases)
+python -m hardening.stress_suite
+
+# 5. Train/Evaluate the IDD Perception Detector and Segmenter
 python -m perception.train_detector --epochs 5
 python -m perception.train_segmenter --epochs 5
 
-# 4. Launch the standalone AV Telemetry & Simulation Server
+# 6. Launch the standalone AV Telemetry & Simulation Server
 python -m dashboard.server
 ```
 
@@ -129,5 +135,6 @@ All 5 hallmark Indian scenarios evaluated across `EASY`, `MEDIUM`, `HARD`, and `
 | `05_cattle_crossing` | EXTREME | 100% | 1.50 | 1.20 | 1.65 | **PASS** |
 
 - **Zero Collisions** across all 20 episodes.
-- Full details documented in [`docs/BENCHMARK_SCORECARD.md`](docs/BENCHMARK_SCORECARD.md).
+- Full details documented in [`docs/BENCHMARK_SCORECARD.md`](docs/BENCHMARK_SCORECARD.md), [`docs/EVALUATION_REPORT.md`](docs/EVALUATION_REPORT.md), [`docs/DECISION_AUDIT_LOG.md`](docs/DECISION_AUDIT_LOG.md), and [`docs/HARDENING_REPORT.md`](docs/HARDENING_REPORT.md).
+
 
