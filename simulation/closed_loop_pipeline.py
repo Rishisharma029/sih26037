@@ -104,28 +104,30 @@ class ClosedLoopAutonomyPipeline:
         step_idx = self.metrics.step_count
 
         # 1. SENSE & PERCEPTION: Extract detected obstacles & drivable corridor
+        from coordinates import transform_actor_to_ego_tracked_obstacle
         obstacles: List[TrackedObstacle] = []
         for actor in self.env.actors:
             dx = actor.x - ego_state.pose.position.x
             dy = actor.y - ego_state.pose.position.y
             dist = math.hypot(dx, dy)
-            vx = actor.speed_mps * math.cos(actor.yaw_rad)
-            vy = actor.speed_mps * math.sin(actor.yaw_rad)
 
             # Check sensor field-of-view (within 45m range)
             if dist <= 45.0:
-                obs = TrackedObstacle(
-                    id=actor.id,
+                obs = transform_actor_to_ego_tracked_obstacle(
+                    actor_id=actor.id,
                     obstacle_class=actor.obstacle_class,
-                    confidence=0.95,
-                    bbox=BoundingBox3D(
-                        center=Point3D(x=actor.x, y=actor.y, z=0.5),
-                        size=Vector3D(x=actor.length_m, y=actor.width_m, z=1.5),
-                        yaw_rad=actor.yaw_rad
-                    ),
-                    velocity=Vector3D(x=vx, y=vy, z=0.0),
-                    distance_m=dist,
-                    is_static=actor.is_static
+                    x_world=actor.x,
+                    y_world=actor.y,
+                    z_world=0.5,
+                    length_m=actor.length_m,
+                    width_m=actor.width_m,
+                    height_m=1.5,
+                    yaw_world_rad=actor.yaw_rad,
+                    speed_mps=actor.speed_mps,
+                    is_static=actor.is_static,
+                    ego_pose=ego_state.pose,
+                    ego_twist=ego_state.twist,
+                    confidence=0.95
                 )
                 obstacles.append(obs)
 

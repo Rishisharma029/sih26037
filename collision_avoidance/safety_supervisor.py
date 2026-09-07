@@ -20,18 +20,23 @@ class SafetySupervisoryLayer:
 
     def __init__(
         self,
-        aeb_ttc_threshold_s: float = 0.85,
-        warning_ttc_threshold_s: float = 1.6,
-        min_barrier_dist_m: float = 1.5
+        aeb_ttc_threshold_s: float = 1.0,
+        replan_ttc_threshold_s: float = 2.0,
+        slowdown_ttc_threshold_s: float = 4.0,
+        min_barrier_dist_m: float = 1.5,
+        warning_ttc_threshold_s: Optional[float] = None
     ):
         self.aeb_ttc_threshold_s = aeb_ttc_threshold_s
-        self.warning_ttc_threshold_s = warning_ttc_threshold_s
+        self.replan_ttc_threshold_s = replan_ttc_threshold_s if warning_ttc_threshold_s is None else warning_ttc_threshold_s
+        self.slowdown_ttc_threshold_s = slowdown_ttc_threshold_s
+        self.min_barrier_dist_m = min_barrier_dist_m
+        
         self.ttc_calc = TTCCalculator(
-            warning_threshold_s=warning_ttc_threshold_s,
-            critical_threshold_s=aeb_ttc_threshold_s
+            caution_threshold_s=self.slowdown_ttc_threshold_s,
+            warning_threshold_s=self.replan_ttc_threshold_s,
+            critical_threshold_s=self.aeb_ttc_threshold_s
         )
         self.cbf_filter = ControlBarrierFilter(min_safe_dist_m=min_barrier_dist_m)
-        self.min_barrier_dist_m = min_barrier_dist_m
         self.aeb_trigger_count = 0
         self.emergency_replan_count = 0
 
@@ -42,7 +47,14 @@ class SafetySupervisoryLayer:
         perception: PerceptionOutput,
         prediction: PredictionOutput
     ) -> SafeTrajectory:
-        """Independently verifies planned trajectory against hard safety constraints."""
+        """Independently verifies planned trajectory against hard safety constraints.
+        
+        Enforces hierarchical safety arbitration rules:
+        - Tier 1: TTC < 1.0s or Critical Physical Collision Barrier Breach -> Emergency Brake (AEB)
+        - Tier 2: 1.0s <= TTC < 2.0s or Dynamic Incursion -> Emergency Replan
+        - Tier 3: 2.0s <= TTC <= 4.0s or CBF Verge/Obstacle Proximity -> Slowdown / Caution
+        - Tier 4: TTC > 4.0s -> Normal Pass-through / Planned Action
+        """
         # 1. Evaluate Dynamic Time-to-Collision
         risk = self.ttc_calc.compute_ttc(ego_state, perception.obstacles)
 
@@ -56,13 +68,15 @@ class SafetySupervisoryLayer:
             planned, ego_state, perception, prediction
         )
 
+        closest_dist = min([obs.distance_m for obs in perception.obstacles], default=999.0)
+
         safety_action = SafetyAction.NONE
         is_e_stop = False
         replan_recommended = False
         safety_status_reason = "TRAJECTORY_VERIFIED_SAFE"
 
-        # Priority 1: Critical TTC or Imminent Impact -> Autonomous Emergency Braking (AEB)
-        if risk.min_ttc_seconds < self.aeb_ttc_threshold_s:
+        # Tier 1: Critical TTC (< 1.0s) or Imminent Physical Impact -> Autonomous Emergency Braking (AEB)
+        if risk.min_ttc_seconds < self.aeb_ttc_threshold_s or (closest_dist < 1.2 and ego_state.twist.speed_mps > 0.5):
             self.aeb_trigger_count += 1
             safety_action = SafetyAction.EMERGENCY_BRAKE
             is_e_stop = True
@@ -72,31 +86,42 @@ class SafetySupervisoryLayer:
                 wp.speed_mps = 0.0
                 wp.acceleration_mps2 = -6.5
 
-        # Priority 2: Unexpected Dynamic Obstacle Incursion -> Emergency Re-plan
-        elif unexpected_incursion:
+        # Tier 2: 1.0s <= TTC < 2.0s or Unexpected Dynamic Incursion -> Emergency Re-plan
+        elif unexpected_incursion or risk.min_ttc_seconds < self.replan_ttc_threshold_s:
             self.emergency_replan_count += 1
             safety_action = SafetyAction.EMERGENCY_REPLAN
             replan_recommended = True
-            safety_status_reason = f"UNEXPECTED_OBSTACLE_INCURSION ({incursion_id}) -> EMERGENCY_REPLAN"
-            # Apply safe slowdown while awaiting re-plan
+            if unexpected_incursion:
+                safety_status_reason = f"UNEXPECTED_OBSTACLE_INCURSION ({incursion_id}) -> EMERGENCY_REPLAN"
+            else:
+                safety_status_reason = f"EMERGENCY_REPLAN_TRIGGERED (TTC={risk.min_ttc_seconds:0.2f}s)"
+            # Apply defensive slowdown crawl while awaiting re-plan
             for wp in filtered_traj.waypoints:
                 wp.speed_mps = min(wp.speed_mps, max(1.5, ego_state.twist.speed_mps * 0.5))
                 wp.acceleration_mps2 = -2.5
 
-        # Priority 3: Control Barrier Function Override
-        elif barrier_violated:
-            safety_action = SafetyAction.CONTROL_BARRIER_OVERRIDE
-            safety_status_reason = f"CONTROL_BARRIER_OVERRIDE (Margin={barrier_margin:0.2f}m)"
+        # Tier 3: 2.0s <= TTC <= 4.0s or CBF Verge/Obstacle Proximity -> Slowdown / Caution
+        elif risk.min_ttc_seconds <= self.slowdown_ttc_threshold_s or barrier_violated:
+            if barrier_violated:
+                safety_action = SafetyAction.CONTROL_BARRIER_OVERRIDE
+                safety_status_reason = f"CONTROL_BARRIER_OVERRIDE (Margin={barrier_margin:0.2f}m)"
+            else:
+                safety_action = SafetyAction.ADAPTIVE_CRUISE_SLOWDOWN
+                safety_status_reason = f"CAUTION_SLOWDOWN (TTC={risk.min_ttc_seconds:0.2f}s)"
+                # Scale speed down proportionally to TTC
+                target_v_safe = max(1.5, risk.min_ttc_seconds * 1.35)
+                for wp in filtered_traj.waypoints:
+                    if wp.speed_mps > target_v_safe:
+                        wp.speed_mps = round(target_v_safe, 2)
+                        wp.acceleration_mps2 = min(wp.acceleration_mps2, -1.8)
 
-        # Priority 4: Planned Nudge / Follow / Cruise Confirmation
+        # Tier 4: TTC > 4.0s -> Normal Pass-through / Planned Action Confirmation
         elif planned.behavior_mode.value.startswith("NUDGE"):
             safety_action = SafetyAction.CORRIDOR_NUDGE
             safety_status_reason = "PLANNED_NUDGE_VERIFIED"
         elif planned.behavior_mode.value == "FOLLOW":
             safety_action = SafetyAction.ADAPTIVE_CRUISE_SLOWDOWN
             safety_status_reason = "SAFE_FOLLOW_VERIFIED"
-
-        closest_dist = min([obs.distance_m for obs in perception.obstacles], default=999.0)
 
         return SafeTrajectory(
             timestamp=ego_state.timestamp,

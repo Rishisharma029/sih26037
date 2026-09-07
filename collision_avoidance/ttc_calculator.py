@@ -7,7 +7,13 @@ from interfaces import TrackedObstacle, EgoVehicleState, TTCResult, CollisionRis
 class TTCCalculator:
     """Calculates vector TTC taking into account 2D relative closing speed and collision swaths."""
 
-    def __init__(self, warning_threshold_s: float = 1.8, critical_threshold_s: float = 0.85):
+    def __init__(
+        self,
+        caution_threshold_s: float = 4.0,
+        warning_threshold_s: float = 2.0,
+        critical_threshold_s: float = 1.0
+    ):
+        self.caution_threshold_s = caution_threshold_s
         self.warning_threshold_s = warning_threshold_s
         self.critical_threshold_s = critical_threshold_s
 
@@ -66,11 +72,19 @@ class TTCCalculator:
                 min_ttc = ttc
                 closest_id = obs.id
 
-        risk_level = 0.0
+        # Graded overall collision risk assessment [0.0 - 1.0]
         if min_ttc < self.critical_threshold_s:
             risk_level = 1.0
-        elif min_ttc < self.warning_threshold_s:
-            risk_level = 0.5
+        elif min_ttc <= self.warning_threshold_s:
+            # Interpolate risk between 0.50 and 0.95
+            ratio = (self.warning_threshold_s - min_ttc) / max(0.01, self.warning_threshold_s - self.critical_threshold_s)
+            risk_level = round(0.50 + 0.45 * ratio, 2)
+        elif min_ttc <= self.caution_threshold_s:
+            # Interpolate risk between 0.10 and 0.49
+            ratio = (self.caution_threshold_s - min_ttc) / max(0.01, self.caution_threshold_s - self.warning_threshold_s)
+            risk_level = round(0.10 + 0.39 * ratio, 2)
+        else:
+            risk_level = 0.0
 
         return CollisionRisk(
             timestamp=ego_state.timestamp,
