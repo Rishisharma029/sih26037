@@ -64,31 +64,36 @@ class BaselinePlanner:
         num_steps = int(self.horizon_seconds / self.dt)
         T = self.horizon_seconds
 
-        # Corridor boundaries
-        corridor_half_w = max(2.1, perception.drivable_corridor.average_width_m * 0.5)
-        d_left_limit = corridor_half_w - self.vehicle_half_width
-        d_right_limit = -corridor_half_w + self.vehicle_half_width
+        # Helper to interpolate corridor boundaries at relative station s_rel
+        corridor_bps = perception.drivable_corridor.boundary_points
+
+        def get_local_corridor_limits(s_rel: float) -> Tuple[float, float]:
+            if not corridor_bps:
+                hw = max(2.1, perception.drivable_corridor.average_width_m * 0.5)
+                return hw, -hw
+            # Find nearest or bracket
+            for idx in range(len(corridor_bps) - 1):
+                bp0 = corridor_bps[idx]
+                bp1 = corridor_bps[idx + 1]
+                if bp0.s <= s_rel <= bp1.s:
+                    alpha = (s_rel - bp0.s) / max(0.01, bp1.s - bp0.s)
+                    dl = bp0.d_left + alpha * (bp1.d_left - bp0.d_left)
+                    dr = bp0.d_right + alpha * (bp1.d_right - bp0.d_right)
+                    return dl, dr
+            if s_rel < corridor_bps[0].s:
+                return corridor_bps[0].d_left, corridor_bps[0].d_right
+            return corridor_bps[-1].d_left, corridor_bps[-1].d_right
 
         scored_candidates: List[Tuple[float, float, List[TrajectoryPoint], BehaviorMode]] = []
         raw_candidates_info: List[dict] = []
 
-        # 1. Generate and evaluate each lateral offset candidate
+        # 1. Generate and evaluate each lateral offset candidate across the irregular corridor
         for offset in self.lateral_offsets:
-            # Check if target offset is within drivable road corridor
-            if offset > d_left_limit or offset < d_right_limit:
-                raw_candidates_info.append({
-                    "offset": offset,
-                    "is_feasible": False,
-                    "is_selected": False,
-                    "cost": 9999.0,
-                    "rejection_reason": "CORRIDOR_BREACH",
-                    "waypoints": []
-                })
-                continue
-
             waypoints: List[TrajectoryPoint] = []
             is_collision = False
             collision_obs_id = ""
+            collision_pt = None
+            anomaly_cost = 0.0
 
             for i in range(1, num_steps + 1):
                 t = i * self.dt
@@ -110,6 +115,20 @@ class BaselinePlanner:
                 s_dot = current_speed + ((v_target - current_speed) / T) * t
                 s_ddot = (v_target - current_speed) / T
 
+                # Check dynamic corridor limits at this longitudinal station s_val
+                dl_curr, dr_curr = get_local_corridor_limits(s_val)
+                if (d_val + self.vehicle_half_width) > (dl_curr - 0.10) or (d_val - self.vehicle_half_width) < (dr_curr + 0.10):
+                    is_collision = True
+                    collision_obs_id = "ROAD_EDGE_DITCH"
+                    # Global world coordinates for collision marker
+                    cos_h = math.cos(current_yaw)
+                    sin_h = math.sin(current_yaw)
+                    collision_pt = {
+                        "x": round(current_x + s_val * cos_h - d_val * sin_h, 3),
+                        "y": round(current_y + s_val * sin_h + d_val * cos_h, 3)
+                    }
+                    break
+
                 # Analytical speed and curvature
                 speed_t = math.hypot(s_dot, d_dot)
                 curvature_t = (s_dot * d_ddot - s_ddot * d_dot) / max(0.01, speed_t ** 3)
@@ -123,7 +142,7 @@ class BaselinePlanner:
                 wy = current_y + s_val * sin_h + d_val * cos_h
                 yaw_t = current_yaw + math.atan2(d_dot, max(0.1, s_dot))
 
-                # Check Collision with all perceived obstacles (in vehicle frame: s_val ahead, d_val lateral)
+                # Check Collision with perceived dynamic/static obstacles
                 for obs in perception.obstacles:
                     obs_x = obs.bbox.center.x  # forward distance in ego frame
                     obs_y = obs.bbox.center.y  # lateral distance in ego frame
@@ -133,11 +152,31 @@ class BaselinePlanner:
                     dx = abs(s_val - obs_x)
                     dy = abs(d_val - obs_y)
 
-                    # Collision checking using longitudinal and lateral footprints
                     if dx < (1.5 + obs_half_l + 0.2) and dy < (self.vehicle_half_width + obs_half_w + 0.1):
                         is_collision = True
                         collision_obs_id = obs.id
+                        collision_pt = {"x": round(wx, 3), "y": round(wy, 3)}
                         break
+
+                if is_collision:
+                    break
+
+                # Check Collision / Penalty with Road Anomalies (Potholes, Gravel heaps)
+                for anom in perception.anomalies:
+                    # Anomaly distance from vehicle position (wx, wy)
+                    adx = wx - anom.position.x
+                    ady = wy - anom.position.y
+                    adist = math.hypot(adx, ady)
+                    if adist < (anom.radius_m + self.vehicle_half_width * 0.7):
+                        if abs(anom.depth_or_height_m) > 0.12 or anom.anomaly_type == "GRAVEL":
+                            # Severe crater / blocked patch -> reject candidate
+                            is_collision = True
+                            collision_obs_id = f"{anom.anomaly_type}_{anom.id}"
+                            collision_pt = {"x": round(wx, 3), "y": round(wy, 3)}
+                            break
+                        else:
+                            # Minor pothole -> penalize cost
+                            anomaly_cost += 2.5
 
                 if is_collision:
                     break
@@ -154,8 +193,8 @@ class BaselinePlanner:
                 ))
 
             if not is_collision and len(waypoints) == num_steps:
-                # Candidate Cost = |offset| * 2.5 + (deviation penalty)
-                cost = abs(offset) * 2.5 + (0.5 if offset != 0.0 else 0.0)
+                # Candidate Cost = |offset| * 2.5 + (deviation penalty) + anomaly_cost
+                cost = abs(offset) * 2.5 + (0.5 if offset != 0.0 else 0.0) + anomaly_cost
 
                 if offset > 0.25:
                     mode = BehaviorMode.NUDGE_LEFT
@@ -174,7 +213,7 @@ class BaselinePlanner:
                     "rejection_reason": "CLEAR",
                     "waypoints": [{"x": wp.x, "y": wp.y} for wp in waypoints]
                 })
-                collision_pt = {"x": round(wx, 3), "y": round(wy, 3)} if is_collision else None
+            else:
                 raw_candidates_info.append({
                     "offset": offset,
                     "is_feasible": False,
