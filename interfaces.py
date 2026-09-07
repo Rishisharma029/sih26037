@@ -302,6 +302,9 @@ class SafeTrajectory(BaseModel):
     waypoints: List[TrajectoryPoint] = Field(default_factory=list)
     safety_action: SafetyAction
     is_emergency_stop: bool = Field(False)
+    is_rejected: bool = Field(False, description="True if proposed planned trajectory was rejected by safety supervisor")
+    rejection_reason: Optional[str] = Field(None, description="Specific safety violation reason triggering trajectory rejection")
+    supervisor_gate_status: str = Field("PASSED_SAFE", description="Gate status: PASSED_SAFE, REJECTED_AEB, REJECTED_REPLAN, REJECTED_SLOWDOWN")
     barrier_margin_m: float = Field(..., description="Minimum distance margin to nearest constraint")
     min_ttc_seconds: float = Field(..., ge=0.0)
     replan_recommended: bool = Field(False, description="True if safety layer requests an emergency replan")

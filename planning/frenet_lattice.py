@@ -6,7 +6,6 @@ from interfaces import TrajectoryPoint, PlannedTrajectory, BehaviorMode, EgoVehi
 
 class QuinticPolynomial:
     """1D quintic polynomial boundary value solver:
-
     s(t) = a0 + a1*t + a2*t^2 + a3*t^3 + a4*t^4 + a5*t^5
     """
 
@@ -15,8 +14,6 @@ class QuinticPolynomial:
         self.a1 = vxs
         self.a2 = 0.5 * axs
 
-        # Matrix formulation for [a3, a4, a5]
-        # A * [a3, a4, a5]^T = B
         T2 = T * T
         T3 = T2 * T
         T4 = T3 * T
@@ -26,8 +23,6 @@ class QuinticPolynomial:
         b1 = vxe - self.a1 - 2.0 * self.a2 * T
         b2 = axe - 2.0 * self.a2
 
-        # Invert 3x3 matrix explicitly for high efficiency
-        # [[T^3, T^4, T^5], [3T^2, 4T^3, 5T^4], [6T, 12T^2, 20T^3]]
         det = 2.0 * T5
         if abs(det) < 1e-6:
             self.a3 = 0.0
@@ -83,9 +78,11 @@ class CandidateTrajectory:
         target_d: float,
         target_v: float,
         horizon_t: float,
-        waypoints: List[TrajectoryPoint]
+        waypoints: List[TrajectoryPoint],
+        label: str = ""
     ):
         self.candidate_id = candidate_id
+        self.label = label or candidate_id
         self.target_d = target_d
         self.target_v = target_v
         self.horizon_t = horizon_t
@@ -111,36 +108,42 @@ class FrenetLatticeGenerator:
 
     def __init__(self, dt: float = 0.2):
         self.dt = dt
-        # Lateral sample offsets (relative to road center or current ego lateral position)
-        self.lateral_offsets = [-1.8, -1.2, -0.6, 0.0, 0.6, 1.2, 1.8]
+        # Primary candidate offsets
+        self.lateral_offsets = [
+            (1.5, "P1 (Nudge Left +1.5m)"),
+            (1.0, "P2 (Slight Left +1.0m)"),
+            (0.5, "P3 (Nudge Left +0.5m)"),
+            (0.0, "P4 (Centerline 0.0m)"),
+            (-0.5, "P5 (Nudge Right -0.5m)"),
+            (-1.0, "P6 (Slight Right -1.0m)"),
+            (-1.5, "P7 (Nudge Right -1.5m)"),
+        ]
         # Speed scaling factors relative to cruise speed
-        self.speed_ratios = [0.0, 0.40, 0.70, 1.00]
+        self.speed_ratios = [1.00, 0.70, 0.40, 0.0]
         # Planning horizons (seconds)
-        self.horizons = [2.5, 3.0]
+        self.horizons = [2.5]
 
     def sample_candidates(
         self,
         ego_state: EgoVehicleState,
         target_cruise_speed_mps: float
     ) -> List[CandidateTrajectory]:
-        """Generate candidate trajectory lattice using quintic polynomial generation."""
+        """Generate candidate trajectory lattice (P1, P2, P3, P4, P5, P6, P7...) using quintic polynomials."""
         candidates: List[CandidateTrajectory] = []
 
         x0 = ego_state.pose.position.x
         y0 = ego_state.pose.position.y
         yaw0 = ego_state.pose.heading_rad
         v0 = ego_state.twist.speed_mps
-        # Longitudinal velocity component approx equal to speed
         vx0 = max(0.1, v0 * math.cos(yaw0))
         vy0 = v0 * math.sin(yaw0)
         ax0 = 0.0
         ay0 = 0.0
 
-        cand_idx = 0
+        p_counter = 1
         for T in self.horizons:
             steps = max(5, int(T / self.dt))
-            for d_target in self.lateral_offsets:
-                # Lateral polynomial y(t): from y0 -> d_target with 0 terminal lateral velocity/acc
+            for d_target, base_label in self.lateral_offsets:
                 poly_lat = QuinticPolynomial(
                     xs=y0, vxs=vy0, axs=ay0,
                     xe=d_target, vxe=0.0, axe=0.0,
@@ -148,11 +151,7 @@ class FrenetLatticeGenerator:
                 )
 
                 for spd_ratio in self.speed_ratios:
-                    cand_idx += 1
                     v_end = target_cruise_speed_mps * spd_ratio
-
-                    # Longitudinal polynomial x(t): target end speed v_end
-                    # Approximate target distance over time T
                     avg_v = max(0.1, 0.5 * (vx0 + v_end))
                     x_end = x0 + avg_v * T
 
@@ -178,7 +177,6 @@ class FrenetLatticeGenerator:
                         spd = math.hypot(vx, vy)
                         yaw = math.atan2(vy, vx) if spd > 0.05 else yaw0
 
-                        # Path curvature kappa = (vx * ay - vy * ax) / (vx^2 + vy^2)^(1.5)
                         spd_sq = vx * vx + vy * vy
                         if spd_sq > 0.01:
                             kappa = (vx * ay - vy * ax) / (spd_sq ** 1.5)
@@ -199,13 +197,17 @@ class FrenetLatticeGenerator:
                             jerk_mps3=total_jerk
                         ))
 
+                    cand_id = f"P{p_counter}"
+                    spd_desc = f"{int(spd_ratio*100)}% spd"
                     cand = CandidateTrajectory(
-                        candidate_id=f"cand_{cand_idx}_d{d_target:+0.1f}_v{v_end:0.1f}",
+                        candidate_id=cand_id,
                         target_d=d_target,
                         target_v=v_end,
                         horizon_t=T,
-                        waypoints=waypoints
+                        waypoints=waypoints,
+                        label=f"{cand_id} ({base_label.split('(')[-1].replace(')', '')}, {spd_desc})"
                     )
                     candidates.append(cand)
+                    p_counter += 1
 
         return candidates

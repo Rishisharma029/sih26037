@@ -1,6 +1,6 @@
 """Adaptive Frenet-frame lattice trajectory planner for Indian traffic."""
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from interfaces import (
     PlannedTrajectory, TrajectoryPoint, BehaviorMode,
     EgoVehicleState, PerceptionOutput, PredictionOutput
@@ -14,22 +14,28 @@ class AdaptiveLatticePlanner:
     """Adaptive Multi-Candidate Frenet-Lattice Trajectory Planner.
 
     Generates a rich bundle of candidate trajectories across lateral offsets and speeds,
-    evaluates them against safety, clearance, boundary traversability, comfort, progress,
-    and uncertainty penalties, and selects the safest feasible trajectory.
+    evaluates them against the 7-objective normalized scoring model:
+      - 40% Collision Safety
+      - 20% Obstacle Clearance
+      - 15% Road Traversability (Boundary Invariant)
+      - 10% Goal Progress
+      - 5%  Path Smoothness
+      - 5%  Vehicle Dynamics & Comfort
+      - 5%  Dynamic Uncertainty
+    and selects the optimal feasible trajectory with full explainability.
     """
 
     def __init__(
         self,
-        horizon_seconds: float = 3.0,
+        horizon_seconds: float = 2.5,
         dt: float = 0.2,
-        w_safety: float = 250.0,
-        w_clearance: float = 60.0,
-        w_traversability: float = 300.0,
-        w_progress: float = 25.0,
-        w_path_length: float = 10.0,
-        w_curvature: float = 40.0,
-        w_comfort: float = 30.0,
-        w_uncertainty: float = 80.0
+        w_collision: float = 0.40,
+        w_clearance: float = 0.20,
+        w_traversability: float = 0.15,
+        w_progress: float = 0.10,
+        w_smoothness: float = 0.05,
+        w_dynamics: float = 0.05,
+        w_uncertainty: float = 0.05
     ):
         self.horizon_seconds = horizon_seconds
         self.dt = dt
@@ -37,16 +43,18 @@ class AdaptiveLatticePlanner:
         self.behavior_planner = BehaviorPlanner()
         self.lattice_generator = FrenetLatticeGenerator(dt=dt)
         self.cost_evaluator = TrajectoryCostEvaluator(
-            w_safety=w_safety,
+            w_collision=w_collision,
             w_clearance=w_clearance,
             w_traversability=w_traversability,
             w_progress=w_progress,
-            w_path_length=w_path_length,
-            w_curvature=w_curvature,
-            w_comfort=w_comfort,
+            w_smoothness=w_smoothness,
+            w_dynamics=w_dynamics,
             w_uncertainty=w_uncertainty
         )
         self.last_candidate_scores: List[TrajectoryCostScore] = []
+        self.last_scored_candidates: List[Tuple[CandidateTrajectory, TrajectoryCostScore]] = []
+        self.last_selected_candidate_id: Optional[str] = None
+        self.last_decision_explanation: str = "Initializing planner"
 
     def plan(
         self,
@@ -55,8 +63,7 @@ class AdaptiveLatticePlanner:
         prediction: PredictionOutput,
         target_cruise_speed_mps: float = 8.0
     ) -> PlannedTrajectory:
-        """Generate candidate trajectory bundle, evaluate multi-objective costs,
-
+        """Generate candidate trajectory bundle, evaluate 7-objective scores,
         and select the globally optimal feasible path.
         """
         self.plan_counter += 1
@@ -67,7 +74,7 @@ class AdaptiveLatticePlanner:
             target_cruise_speed_mps=target_cruise_speed_mps
         )
 
-        # 2. Evaluate multi-objective cost for each candidate
+        # 2. Evaluate 7-objective cost for each candidate
         scored_candidates: List[Tuple[CandidateTrajectory, TrajectoryCostScore]] = []
         for cand in candidates:
             score = self.cost_evaluator.evaluate(
@@ -78,6 +85,7 @@ class AdaptiveLatticePlanner:
             )
             scored_candidates.append((cand, score))
 
+        self.last_scored_candidates = scored_candidates
         self.last_candidate_scores = [s for _, s in scored_candidates]
 
         # 3. Filter feasible candidates
@@ -90,6 +98,13 @@ class AdaptiveLatticePlanner:
             # Sort by total cost ascending
             feasible_candidates.sort(key=lambda item: item[1].total_cost)
             best_cand, best_score = feasible_candidates[0]
+
+            self.last_selected_candidate_id = best_cand.candidate_id
+            self.last_decision_explanation = (
+                f"Selected {best_cand.label} [Cost: {best_score.total_cost:.1f}]: "
+                f"Clearance {best_score.min_clearance_m:.2f}m, "
+                f"Boundary Margin {best_score.min_boundary_margin_m:.2f}m. {best_score.explanation}"
+            )
 
             # Classify behavior mode from selected trajectory
             behavior = self._infer_behavior_mode(best_cand, target_cruise_speed_mps)
@@ -105,15 +120,17 @@ class AdaptiveLatticePlanner:
             )
         else:
             # Fallback: All candidate paths are blocked -> execute safe controlled stop
+            self.last_selected_candidate_id = "FALLBACK_STOP"
+            self.last_decision_explanation = "All candidate corridors blocked. Executing emergency controlled stop."
             return self._generate_fallback_stop(ego_state)
 
     def _infer_behavior_mode(self, cand: CandidateTrajectory, cruise_speed: float) -> BehaviorMode:
         """Map selected candidate parameters to standard BehaviorMode."""
         if cand.target_v < 0.5:
             return BehaviorMode.EMERGENCY_STOP
-        elif cand.target_d > 0.5:
+        elif cand.target_d > 0.4:
             return BehaviorMode.NUDGE_LEFT
-        elif cand.target_d < -0.5:
+        elif cand.target_d < -0.4:
             return BehaviorMode.NUDGE_RIGHT
         elif cand.target_v < cruise_speed * 0.75:
             return BehaviorMode.FOLLOW
@@ -129,7 +146,6 @@ class AdaptiveLatticePlanner:
         waypoints = []
         for i in range(1, steps + 1):
             t = ego_state.timestamp + i * self.dt
-            # Linear deceleration to 0
             v_t = max(0.0, curr_v * (1.0 - (i / steps)))
             dist = (curr_v + v_t) * 0.5 * (i * self.dt)
             waypoints.append(TrajectoryPoint(
