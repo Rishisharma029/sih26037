@@ -110,37 +110,45 @@ class SimulationEngineState:
         margin = min(margin_left, margin_right)
         self.min_corridor_margin = min(self.min_corridor_margin, margin)
 
-        # 5. Actors list & Multi-Modal Prediction for visualizer
+        # 5. Transform all Actors to standard Ego Vehicle Coordinates
         actors_data = []
         obstacles = []
+        from coordinates import transform_actor_to_ego_tracked_obstacle
+
         for a in self.scenario.env.actors:
-            rel_dx = a.x - state.pose.position.x
-            rel_dy = a.y - state.pose.position.y
-            vx = a.speed_mps * math.cos(a.yaw_rad)
-            vy = a.speed_mps * math.sin(a.yaw_rad)
-            
-            obs = TrackedObstacle(
-                id=a.id,
+            obs = transform_actor_to_ego_tracked_obstacle(
+                actor_id=a.id,
                 obstacle_class=a.obstacle_class,
-                confidence=0.95,
-                bbox=BoundingBox3D(
-                    center=Point3D(x=a.x, y=a.y, z=0.5),
-                    size=Vector3D(x=a.length_m, y=a.width_m, z=1.5),
-                    yaw_rad=a.yaw_rad
-                ),
-                velocity=Vector3D(x=vx, y=vy, z=0.0),
-                distance_m=math.hypot(rel_dx, rel_dy),
-                is_static=a.is_static
+                x_world=a.x,
+                y_world=a.y,
+                z_world=a.z,
+                length_m=a.length_m,
+                width_m=a.width_m,
+                height_m=a.height_m,
+                yaw_world_rad=a.yaw_rad,
+                speed_mps=a.speed_mps,
+                is_static=a.is_static,
+                ego_pose=state.pose,
+                ego_twist=state.twist,
+                confidence=0.95
             )
             obstacles.append(obs)
+
+            # Compute dynamic Time-To-Collision (TTC) in ego body frame
+            ttc_eval = self.supervisory.ttc_calc.compute_ttc(state, [obs])
+            ttc_val = ttc_eval.min_ttc_seconds if ttc_eval.min_ttc_seconds < 100.0 else None
+
             actors_data.append({
                 "id": a.id,
                 "class": a.obstacle_class.value,
-                "x": round(a.x, 2),
-                "y": round(a.y, 2),
+                "x_world": round(a.x, 2),
+                "y_world": round(a.y, 2),
+                "x_ego": round(obs.bbox.center.x, 2), # Forward distance ahead (+X)
+                "y_ego": round(obs.bbox.center.y, 2), # Lateral distance left (+Y) / right (-Y)
+                "distance_m": round(obs.distance_m, 2), # Euclidean distance (always >= 0)
+                "ttc_s": round(ttc_val, 2) if ttc_val is not None else None,
                 "speed_kph": round(a.speed_mps * 3.6, 1),
                 "yaw_deg": round(math.degrees(a.yaw_rad), 1),
-                "rel_dx": round(rel_dx, 2),
                 "is_static": a.is_static
             })
 
@@ -414,19 +422,25 @@ def create_app() -> FastAPI:
                 ? 'px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow'
                 : 'px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold transition shadow';
 
-            // Update Actors List
+            // Update Actors List with standard Ego Coordinates
             const listEl = document.getElementById('actors-list');
             listEl.innerHTML = '';
             (data.actors || []).forEach(a => {
                 const item = document.createElement('div');
-                item.className = 'p-2.5 rounded-lg bg-slate-900 border border-slate-800 space-y-1';
+                item.className = 'p-2.5 rounded-lg bg-slate-900 border border-slate-800 space-y-1.5';
+                const aheadText = a.x_ego >= 0 ? `+${a.x_ego}m ahead` : `${a.x_ego}m behind`;
+                const latText = a.y_ego >= 0 ? `+${a.y_ego}m L` : `${a.y_ego}m R`;
+                const ttcBadge = a.ttc_s ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${a.ttc_s < 1.5 ? 'bg-rose-900/60 text-rose-300 animate-pulse' : 'bg-amber-900/40 text-amber-300'}">TTC: ${a.ttc_s}s</span>` : '';
                 item.innerHTML = `
                     <div class="flex items-center justify-between font-semibold">
                         <span class="text-slate-200">${a.id}</span>
-                        <span class="text-[10px] px-1.5 py-0.5 rounded ${a.is_static ? 'bg-slate-800 text-slate-400' : 'bg-cyan-900/50 text-cyan-300'}">${a.class}</span>
+                        <div class="flex items-center gap-1">
+                            ${ttcBadge}
+                            <span class="text-[10px] px-1.5 py-0.5 rounded ${a.is_static ? 'bg-slate-800 text-slate-400' : 'bg-cyan-900/50 text-cyan-300'}">${a.class}</span>
+                        </div>
                     </div>
                     <div class="flex justify-between text-[11px] text-slate-400">
-                        <span>Dist: <b class="text-slate-200 font-mono">${a.rel_dx}m</b></span>
+                        <span>Range: <b class="text-slate-200 font-mono">${a.distance_m}m</b> (<span class="text-cyan-400">${aheadText}</span>, <span class="text-purple-400">${latText}</span>)</span>
                         <span>Speed: <b class="text-slate-200 font-mono">${a.speed_kph} km/h</b></span>
                     </div>
                 `;
@@ -476,7 +490,24 @@ def create_app() -> FastAPI:
             ctx.stroke();
             ctx.setLineDash([]);
 
-            // 4. Draw Road Anomalies (Pothole at x=88m)
+            // 4. Draw Ego Range Distance Arcs (+10m, +25m, +50m ahead)
+            const egoScreenX = egoX * scale + offsetX;
+            const egoScreenY = centerY - data.ego.y * scale;
+
+            [10, 25, 50].forEach(r => {
+                ctx.strokeStyle = 'rgba(6, 182, 212, 0.25)';
+                ctx.lineWidth = 1;
+                ctx.setLineDash([3, 6]);
+                ctx.beginPath();
+                ctx.arc(egoScreenX, egoScreenY, r * scale, -Math.PI / 3, Math.PI / 3);
+                ctx.stroke();
+                ctx.fillStyle = 'rgba(6, 182, 212, 0.4)';
+                ctx.font = '9px monospace';
+                ctx.fillText(`+${r}m`, egoScreenX + r * scale + 3, egoScreenY - 4);
+            });
+            ctx.setLineDash([]);
+
+            // 5. Draw Road Anomalies (Pothole at x=88m)
             const potScreenX = 88 * scale + offsetX;
             const potScreenY = centerY - 0.3 * scale;
             ctx.fillStyle = '#0f172a';
@@ -486,10 +517,10 @@ def create_app() -> FastAPI:
             ctx.strokeStyle = '#475569';
             ctx.stroke();
 
-            // 5. Draw Actors
+            // 6. Draw Actors
             (data.actors || []).forEach(a => {
-                const ax = a.x * scale + offsetX;
-                const ay = centerY - a.y * scale;
+                const ax = a.x_world * scale + offsetX;
+                const ay = centerY - a.y_world * scale;
 
                 if (a.id === 'oncoming_tractor') {
                     ctx.fillStyle = '#f59e0b';
@@ -517,12 +548,15 @@ def create_app() -> FastAPI:
                     ctx.arc(ax, ay, 10, 0, Math.PI * 2);
                     ctx.fill();
                 }
+
+                // Metric Tag above actor (Forward distance & lateral offset)
+                ctx.fillStyle = 'rgba(226, 232, 240, 0.85)';
+                ctx.font = '9px monospace';
+                const tag = `${a.x_ego >= 0 ? '+' : ''}${a.x_ego}m (${a.distance_m}m)`;
+                ctx.fillText(tag, ax - 15, ay - 16);
             });
 
-            // 6. Draw Ego Autonomous Vehicle
-            const egoScreenX = egoX * scale + offsetX;
-            const egoScreenY = centerY - data.ego.y * scale;
-
+            // 7. Draw Ego Autonomous Vehicle
             ctx.save();
             ctx.translate(egoScreenX, egoScreenY);
             ctx.rotate(-data.ego.heading_deg * Math.PI / 180);

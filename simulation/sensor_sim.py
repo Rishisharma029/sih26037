@@ -6,6 +6,7 @@ import math
 import random
 from typing import List, Dict, Any, Tuple
 from interfaces import RawSensorFrame, EgoVehicleState, Point3D, Vector3D, ObstacleClass
+from coordinates import world_to_ego_2d, world_to_ego_velocity
 from .environment import RoadEnvironment
 from .actors import SimulationActor
 
@@ -66,13 +67,9 @@ class SyntheticSensorSuite:
         radar_targets: List[RadarTarget] = []
 
         for actor in self.env.actors:
-            dx = actor.x - ego_x
-            dy = actor.y - ego_y
-            dist = math.hypot(dx, dy)
-
-            # Transform to vehicle frame
-            local_x = dx * math.cos(-ego_yaw) - dy * math.sin(-ego_yaw)
-            local_y = dx * math.sin(-ego_yaw) + dy * math.cos(-ego_yaw)
+            # Transform to vehicle body frame using canonical transformation function
+            local_x, local_y = world_to_ego_2d(actor.x, actor.y, ego_x, ego_y, ego_yaw)
+            dist = math.hypot(local_x, local_y)
 
             if local_x <= 0.0 or dist > self.radar_range_m:
                 continue
@@ -104,10 +101,15 @@ class SyntheticSensorSuite:
 
             # 3. Radar Target (Doppler velocity measurement)
             if dist < self.radar_range_m:
-                # Relative velocity along line of sight
-                rel_vx = actor.speed_mps * math.cos(actor.yaw_rad) - ego_speed * math.cos(ego_yaw)
-                rel_vy = actor.speed_mps * math.sin(actor.yaw_rad) - ego_speed * math.sin(ego_yaw)
-                doppler_radial_v = (dx * rel_vx + dy * rel_vy) / max(0.1, dist)
+                # Relative velocity along line of sight in vehicle frame
+                rel_vx, rel_vy = world_to_ego_velocity(
+                    vx_world=actor.speed_mps * math.cos(actor.yaw_rad),
+                    vy_world=actor.speed_mps * math.sin(actor.yaw_rad),
+                    ego_heading_rad=ego_yaw,
+                    ego_vx_world=ego_speed * math.cos(ego_yaw),
+                    ego_vy_world=ego_speed * math.sin(ego_yaw)
+                )
+                doppler_radial_v = (local_x * rel_vx + local_y * rel_vy) / max(0.1, dist)
 
                 radar_targets.append(RadarTarget(
                     target_id=f"rad_{actor.id}",

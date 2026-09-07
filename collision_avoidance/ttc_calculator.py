@@ -22,21 +22,35 @@ class TTCCalculator:
         ego_vy = ego_state.twist.speed_mps * math.sin(ego_state.pose.heading_rad)
 
         for obs in obstacles:
-            dx = obs.bbox.center.x - ego_x
-            dy = obs.bbox.center.y - ego_y
-            dist = math.hypot(dx, dy)
+            # Obstacle is already in standardized ego coordinates
+            x_ego = obs.bbox.center.x
+            y_ego = obs.bbox.center.y
+            dist = math.hypot(x_ego, y_ego)
 
-            rel_vx = ego_vx - obs.velocity.x
-            rel_vy = ego_vy - obs.velocity.y
+            # Relative velocity in ego frame:
+            # obs.velocity.x is forward relative velocity (negative = closing in)
+            vx_ego = obs.velocity.x
+            vy_ego = obs.velocity.y
 
-            # 2D Closing velocity projected along range vector
-            closing_speed = (dx * rel_vx + dy * rel_vy) / max(0.1, dist)
+            ego_speed = ego_state.twist.speed_mps
 
-            # Collision swath for ego path (within 1.1m lateral corridor of vehicle trajectory)
-            if dx > 0.0 and abs(dy) < 1.10 and closing_speed > 0.15:
+            # 2D Closing velocity projected along line-of-sight range vector
+            if obs.is_static:
+                closing_speed = ego_speed * (x_ego / max(0.1, dist)) if x_ego > 0.0 else 0.0
+            elif vx_ego < 0.0:
+                # Direct relative approach velocity in ego frame (negative = closing in)
+                closing_speed = -(x_ego * vx_ego + y_ego * vy_ego) / max(0.1, dist)
+            else:
+                # Forward speed specified (e.g. lead vehicle slower than ego)
+                rel_vx = ego_speed - vx_ego
+                closing_speed = (x_ego * rel_vx - y_ego * vy_ego) / max(0.1, dist) if rel_vx > 0.0 else 0.0
+
+            # Collision swath evaluation (vehicle width ~ 1.8m + safety envelope -> half swath 1.15m)
+            # Active only for obstacles ahead in forward corridor (x_ego > 0)
+            if x_ego > 0.0 and abs(y_ego) < 1.20 and closing_speed > 0.15:
                 ttc = dist / closing_speed
-            elif 0.0 < dx < 25.0 and abs(dy) < 1.10 and ego_vx > 0.3 and obs.is_static:
-                ttc = dx / ego_vx
+            elif 0.0 < x_ego < 30.0 and abs(y_ego) < 1.20 and ego_speed > 0.3 and obs.is_static:
+                ttc = x_ego / ego_speed
             else:
                 ttc = float("inf")
 

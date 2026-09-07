@@ -59,13 +59,24 @@ class MultiSensorKalmanFusion:
                 track.missed_steps = 0
                 track.age_steps += 1
             else:
-                # Initialize new track
+                # Initialize new track in ego body frame
                 self.track_counter += 1
                 new_id = f"trk_{self.track_counter:03d}"
+                world_pos = None
+                if ego_state:
+                    from coordinates import ego_to_world_2d
+                    wx, wy = ego_to_world_2d(
+                        cluster.centroid.x, cluster.centroid.y,
+                        ego_state.pose.position.x, ego_state.pose.position.y,
+                        ego_state.pose.heading_rad
+                    )
+                    world_pos = Point3D(x=wx, y=wy, z=cluster.centroid.z)
+
                 self.tracks[new_id] = WorldModelTrack(
                     object_id=new_id,
                     obstacle_type=ObstacleClass.UNKNOWN,
                     position=cluster.centroid,
+                    world_position=world_pos,
                     velocity=Vector3D(x=0.0, y=0.0, z=0.0),
                     heading_rad=0.0,
                     size=cluster.size,

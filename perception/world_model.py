@@ -24,14 +24,22 @@ class TrackHistoryPoint(BaseModel):
     heading_rad: float
 
 class WorldModelTrack(BaseModel):
-    """Rich dynamic track representing a physical road actor in the environment."""
+    """Rich dynamic track representing a physical road actor in the environment.
+    
+    Coordinate Standards:
+    - `position`: Vehicle body frame (+X=Forward, +Y=Left, +Z=Up) in meters.
+    - `velocity`: Vehicle relative velocity (+Vx=Separating, -Vx=Closing) in m/s.
+    - `heading_rad`: Heading relative to vehicle in range [-pi, pi].
+    - `world_position`: Optional global world coordinate anchor.
+    """
     model_config = ConfigDict(extra="forbid")
     object_id: str = Field(..., description="Unique persistent tracking ID")
     obstacle_type: ObstacleClass = Field(..., description="Perceived object classification")
-    position: Point3D = Field(..., description="Estimated spatial centroid in vehicle coordinates")
+    position: Point3D = Field(..., description="Estimated spatial centroid in vehicle body coordinates (+X=Forward, +Y=Left)")
+    world_position: Optional[Point3D] = Field(default=None, description="Optional global world position anchor")
     velocity: Vector3D = Field(default_factory=lambda: Vector3D(x=0.0, y=0.0, z=0.0))
     acceleration: Vector3D = Field(default_factory=lambda: Vector3D(x=0.0, y=0.0, z=0.0))
-    heading_rad: float = Field(0.0, description="Estimated heading yaw in radians")
+    heading_rad: float = Field(0.0, description="Estimated relative heading yaw in radians")
     size: Vector3D = Field(..., description="Dimensions (Length, Width, Height) in meters")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Fused detection confidence")
     tracking_history: List[TrackHistoryPoint] = Field(default_factory=list)
