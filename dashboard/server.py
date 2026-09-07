@@ -1,11 +1,16 @@
 """
 SIH26037 Autonomous Driving Live BEV Visualizer & Telemetry Server (Port 5002)
 Features:
-1. Unstructured Indian Road Geometry:
+1. Real Indian-Trained Perception Subsystem:
+   - Camera frame ingestion -> Indian Driving Dataset (IDD) neural detection.
+   - 3D Bounding Box monocular estimation.
+   - Multi-Object Tracking (MOT) with persistent track IDs.
+   - Constant-Velocity Kalman Filter estimating linear velocities (vx, vy).
+2. Unstructured Indian Road Geometry:
    - Non-rectangular irregular boundaries, variable width (3.4m choke points -> 5.6m passing bays).
    - Continuous curvature, eroded shoulder verges, ditch drop-offs.
    - Potholes, severe craters, speed bumps, and blocked gravel patches.
-2. Real-Time Autonomous Driving Debug BEV:
+3. Real-Time Autonomous Driving Debug BEV:
    - Organic road contour & unpaved shoulder hatching.
    - Pothole & road anomaly warning zones.
    - Obstacles with velocity vectors & bounding boxes.
@@ -14,7 +19,7 @@ Features:
    - Selected safe trajectory with speed profile.
    - Dynamic vehicle safety envelope & collision zones.
    - 30m Lookahead goal indicator & metric range arcs.
-3. 5-Stage Causal Decision HUD Stepper.
+4. 5-Stage Causal Decision HUD Stepper.
 """
 import sys
 import os
@@ -39,6 +44,7 @@ from scenarios.difficulty import DifficultyLevel
 from vehicle_control.lateral_controller import StanleyLateralController
 from vehicle_control.longitudinal_controller import LongitudinalPIDController
 from collision_avoidance.safety_supervisor import SafetySupervisoryLayer
+from perception.perception_pipeline import UnifiedPerceptionPipeline, PerceptionMode
 from perception.boundary_detector import FreeSpaceBoundaryDetector
 from prediction.trajectory_predictor import TrajectoryPredictor
 from planning.baseline_planner import BaselinePlanner
@@ -51,16 +57,19 @@ class HazardSpawnRequest(BaseModel):
 class DifficultyRequest(BaseModel):
     difficulty: str = "HARD" # EASY | MEDIUM | HARD | EXTREME
 
+class PerceptionModeRequest(BaseModel):
+    mode: str = "NEURAL_IDD" # NEURAL_IDD | GROUND_TRUTH
+
 class SimulationEngineState:
     def __init__(self, difficulty: DifficultyLevel = DifficultyLevel.HARD):
         self.difficulty = difficulty
         self.scenario = UnmarkedVillageRoadScenario(difficulty=self.difficulty)
+        self.perception_pipeline = UnifiedPerceptionPipeline(mode=PerceptionMode.NEURAL_IDD, default_road_width_m=4.3)
         self.lat_ctrl = StanleyLateralController(k_gain=1.4)
         self.lon_ctrl = LongitudinalPIDController(kp=22.0, ki=0.5, kd=2.0)
         self.supervisory = SafetySupervisoryLayer(aeb_ttc_threshold_s=1.0, replan_ttc_threshold_s=2.0, slowdown_ttc_threshold_s=4.0)
         self.planner = BaselinePlanner(horizon_seconds=3.0, dt=0.2)
         self.predictor = TrajectoryPredictor(horizon_seconds=3.0, dt=0.5, mode="ensemble")
-        self.boundary_detector = FreeSpaceBoundaryDetector(default_width_m=4.3)
         self.is_running = True
         self.target_speed_mps = 6.0
         self.is_emergency_stop = False
@@ -80,12 +89,19 @@ class SimulationEngineState:
         self.difficulty = level_map.get(diff_name.upper(), DifficultyLevel.HARD)
         self.reset()
 
+    def set_perception_mode(self, mode_str: str):
+        if mode_str.upper() == "GROUND_TRUTH":
+            self.perception_pipeline.mode = PerceptionMode.GROUND_TRUTH
+        else:
+            self.perception_pipeline.mode = PerceptionMode.NEURAL_IDD
+
     def reset(self):
         self.scenario = UnmarkedVillageRoadScenario(difficulty=self.difficulty)
         self.is_emergency_stop = False
         self.is_completed = False
         self.step_count = 0
         self.min_corridor_margin = 2.0
+        self.perception_pipeline.tracker.tracks.clear()
         self.step()
 
     def spawn_hazard(self, hazard_type: str, dist_ahead: float = 35.0):
@@ -96,8 +112,6 @@ class SimulationEngineState:
         elif hazard_type == "auto":
             self.scenario.spawn_parked_auto(dist_ahead=max(15.0, dist_ahead * 0.5), y=0.9)
         elif hazard_type == "pothole":
-            ego_x = self.scenario.simulator.state.pose.position.x
-            ego_y = self.scenario.simulator.state.pose.position.y
             p_x, p_y, _ = self.scenario.env.geometry.frenet_to_cartesian(self.scenario.simulator.state.pose.position.x + 18.0, 0.0)
             self.scenario.env.add_anomaly(RoadAnomaly(
                 id=f"injected_pothole_{len(self.scenario.env.anomalies)+1}",
@@ -123,81 +137,60 @@ class SimulationEngineState:
             self.is_completed = True
             self.target_speed_mps = 0.0
 
-        # 1. Standardized Perception: transform all actors to ego body frame (+X=forward, +Y=left)
+        # 1. Real Perception Pipeline Execution (Camera -> IDD Neural Detection -> MOT Tracker -> Velocity)
+        perception_frame = self.perception_pipeline.process_frame(
+            timestamp=ego_state.timestamp,
+            current_s=s_curr,
+            geometry=self.scenario.env.geometry,
+            actors=self.scenario.env.actors,
+            ego_state=ego_state,
+            anomalies=self.scenario.env.anomalies,
+            dt=dt
+        )
+        obstacles = perception_frame.obstacles
+
+        # Format perceived actors metadata with persistent track IDs, confidence, and estimated velocities
         actors_data = []
-        obstacles = []
-
-        for a in self.scenario.env.actors:
-            obs = transform_actor_to_ego_tracked_obstacle(
-                actor_id=a.id,
-                obstacle_class=a.obstacle_class,
-                x_world=a.x,
-                y_world=a.y,
-                z_world=a.z,
-                length_m=a.length_m,
-                width_m=a.width_m,
-                height_m=a.height_m,
-                yaw_world_rad=a.yaw_rad,
-                speed_mps=a.speed_mps,
-                is_static=a.is_static,
-                ego_pose=ego_state.pose,
-                ego_twist=ego_state.twist,
-                confidence=0.95
-            )
-            obstacles.append(obs)
-
-            # Compute dynamic Time-To-Collision (TTC) in ego body frame
+        for obs in obstacles:
             ttc_eval = self.supervisory.ttc_calc.compute_ttc(ego_state, [obs])
             ttc_val = ttc_eval.min_ttc_seconds if ttc_eval.min_ttc_seconds < 100.0 else None
 
-            # World velocity vectors
-            vx_world = a.speed_mps * math.cos(a.yaw_rad)
-            vy_world = a.speed_mps * math.sin(a.yaw_rad)
+            # World position reconstruction for rendering
+            from coordinates import ego_to_world_2d
+            wx, wy = ego_to_world_2d(
+                obs.bbox.center.x, obs.bbox.center.y,
+                ego_state.pose.position.x, ego_state.pose.position.y,
+                ego_state.pose.heading_rad
+            )
+
+            speed_mps = math.hypot(obs.velocity.x, obs.velocity.y)
 
             actors_data.append({
-                "id": a.id,
-                "class": a.obstacle_class.value,
-                "x_world": round(a.x, 2),
-                "y_world": round(a.y, 2),
-                "z_world": round(a.z, 2),
-                "length_m": round(a.length_m, 2),
-                "width_m": round(a.width_m, 2),
-                "height_m": round(a.height_m, 2),
-                "yaw_world_deg": round(math.degrees(a.yaw_rad), 1),
+                "id": obs.id,
+                "class": obs.obstacle_class.value,
+                "confidence": round(obs.confidence, 3),
+                "x_world": round(wx, 2),
+                "y_world": round(wy, 2),
                 "x_ego": round(obs.bbox.center.x, 2),
                 "y_ego": round(obs.bbox.center.y, 2),
+                "length_m": round(obs.bbox.size.x, 2),
+                "width_m": round(obs.bbox.size.y, 2),
+                "height_m": round(obs.bbox.size.z, 2),
+                "yaw_deg": round(math.degrees(obs.bbox.yaw_rad), 1),
                 "distance_m": round(obs.distance_m, 2),
                 "ttc_s": round(ttc_val, 2) if ttc_val is not None else None,
-                "speed_mps": round(a.speed_mps, 2),
-                "speed_kph": round(a.speed_mps * 3.6, 1),
-                "vx_world": round(vx_world, 2),
-                "vy_world": round(vy_world, 2),
+                "speed_mps": round(speed_mps, 2),
+                "speed_kph": round(speed_mps * 3.6, 1),
                 "vx_ego": round(obs.velocity.x, 2),
                 "vy_ego": round(obs.velocity.y, 2),
-                "is_static": a.is_static,
-                "safety_radius_m": round(max(a.length_m, a.width_m) * 0.6 + 0.5, 2)
+                "is_static": obs.is_static,
+                "safety_radius_m": round(max(obs.bbox.size.x, obs.bbox.size.y) * 0.6 + 0.5, 2)
             })
 
-        # 2. Road Corridor & Anomalies Detection
-        corridor = self.boundary_detector.detect_corridor(
-            timestamp=ego_state.timestamp,
-            lookahead_m=45.0,
-            step_m=3.0,
-            current_s=s_curr,
-            geometry=self.scenario.env.geometry
-        )
-        perception_frame = PerceptionOutput(
-            timestamp=ego_state.timestamp,
-            frame_id=self.step_count,
-            obstacles=obstacles,
-            drivable_corridor=corridor,
-            anomalies=self.scenario.env.anomalies
-        )
-
-        # 3. Multi-Modal Motion Prediction
+        # 2. Multi-Modal Motion Prediction on Perceived Tracks
         pred_out = self.predictor.predict(perception_frame, ego_speed=ego_state.twist.speed_mps)
 
-        # 4. Adaptive Path Planning (Evaluating Irregular Corridor & Potholes)
+        # 3. Adaptive Path Planning on Perceived Corridor & Anomalies
         planned_traj = self.planner.plan(
             ego_state=ego_state,
             perception=perception_frame,
@@ -205,7 +198,7 @@ class SimulationEngineState:
             target_cruise_speed_mps=self.target_speed_mps
         )
 
-        # 5. Independent Collision Avoidance & Safety Layer Supervision
+        # 4. Independent Collision Avoidance & Safety Supervision
         safe_traj = self.supervisory.supervise(
             planned=planned_traj,
             ego_state=ego_state,
@@ -216,7 +209,7 @@ class SimulationEngineState:
         if safe_traj.is_emergency_stop:
             self.is_emergency_stop = True
 
-        # 6. Drive-By-Wire Vehicle Control Computation
+        # 5. Drive-By-Wire Vehicle Control Computation
         steer = self.lat_ctrl.compute_steering(ego_state, safe_traj)
         throttle, brake = self.lon_ctrl.compute_throttle_brake(ego_state, safe_traj, dt=dt)
 
@@ -233,11 +226,11 @@ class SimulationEngineState:
             emergency_brake_active=self.is_emergency_stop or safe_traj.is_emergency_stop
         )
 
-        # 7. Physics & Vehicle Dynamics Step
+        # 6. Physics & Vehicle Dynamics Step
         state, raw_sensor = self.scenario.run_step(cmd)
         self.step_count += 1
 
-        # 8. Precise Frenet Boundary & Ditch Margin Calculations
+        # 7. Road Boundary & Margin Calculations
         s_post, d_post = self.scenario.env.geometry.cartesian_to_frenet(
             state.pose.position.x,
             state.pose.position.y,
@@ -251,9 +244,9 @@ class SimulationEngineState:
         if margin < 0.0:
             self.is_emergency_stop = True
 
-        # 9. Format Anomalies (Potholes, Speed bumps, Gravel)
+        # 8. Format Anomalies
         anomalies_data = []
-        for anom in self.scenario.env.anomalies:
+        for anom in perception_frame.anomalies:
             xEgo, yEgo = world_to_ego_2d(
                 anom.position.x, anom.position.y,
                 state.pose.position.x, state.pose.position.y,
@@ -272,7 +265,7 @@ class SimulationEngineState:
                 "depth_or_height_m": round(anom.depth_or_height_m, 2)
             })
 
-        # 10. Format Multi-Modal Predictions
+        # 9. Format Multi-Modal Predictions
         predictions_data = []
         for agent in pred_out.agents:
             trajs_data = []
@@ -300,7 +293,7 @@ class SimulationEngineState:
                 "trajectories": trajs_data
             })
 
-        # 11. Extract Collision Zones from Candidates
+        # 10. Extract Collision Zones from Candidates
         collision_zones = []
         for cand in self.planner.last_candidates_summary:
             if not cand.get("is_feasible") and cand.get("collision_point"):
@@ -313,7 +306,7 @@ class SimulationEngineState:
                     "offset_m": cand.get("offset", 0.0)
                 })
 
-        # 12. 30m Lookahead Goal Direction & Road Polyline
+        # 11. 30m Lookahead Goal Direction & Road Polyline
         s_goal = min(self.scenario.env.geometry.length_m - 2.0, s_curr + 30.0)
         gx, gy, goal_yaw = self.scenario.env.geometry.frenet_to_cartesian(s_goal, 0.0)
 
@@ -331,14 +324,13 @@ class SimulationEngineState:
                 "width_m": round(dl - dr, 2)
             })
 
-        # 13. Build Live Causal Decision Chain Data
+        # 12. Build Live Causal Decision Chain Data
         lead_threat = None
         for a in actors_data:
             if a["x_ego"] > 0 and (a["ttc_s"] is not None or a["distance_m"] < 35.0):
                 if lead_threat is None or (a["ttc_s"] or 999) < (lead_threat["ttc_s"] or 999):
                     lead_threat = a
 
-        # Check if any immediate anomaly ahead
         lead_anomaly = None
         for an in anomalies_data:
             if 0 < an["x_ego"] < 25.0 and abs(an["y_ego"]) < 1.2 and abs(an["depth_or_height_m"]) > 0.07:
@@ -386,6 +378,11 @@ class SimulationEngineState:
             "step": self.step_count,
             "vehicle_id": "SIH26037-AV-01",
             "difficulty": self.difficulty.value,
+            "perception": {
+                "mode": self.perception_pipeline.mode.value,
+                "active_tracks_count": len(obstacles),
+                "sensor_health": perception_frame.sensor_health
+            },
             "ego": {
                 "x": round(state.pose.position.x, 2),
                 "y": round(state.pose.position.y, 2),
@@ -464,8 +461,9 @@ def create_app() -> FastAPI:
             "status": "UP",
             "service": "SIH26037 Autonomous Mobility Service",
             "vehicle_id": "SIH26037-AV-01",
-            "scene": "Unmarked Indian Village Road (Unstructured Free-Space)",
+            "scene": "Unmarked Indian Village Road (Neural IDD Perception)",
             "difficulty": sim_engine.difficulty.value,
+            "perception_mode": sim_engine.perception_pipeline.mode.value,
             "e_stop": sim_engine.is_emergency_stop,
             "is_running": sim_engine.is_running
         }
@@ -499,6 +497,11 @@ def create_app() -> FastAPI:
         sim_engine.set_difficulty(req.difficulty)
         return {"status": "DIFFICULTY_SET", "difficulty": sim_engine.difficulty.value}
 
+    @app.post("/simulation/perception_mode")
+    async def set_perception_mode_api(req: PerceptionModeRequest):
+        sim_engine.set_perception_mode(req.mode)
+        return {"status": "PERCEPTION_MODE_UPDATED", "mode": sim_engine.perception_pipeline.mode.value}
+
     @app.websocket("/ws/telemetry")
     async def websocket_telemetry(websocket: WebSocket):
         await websocket.accept()
@@ -516,7 +519,7 @@ def create_app() -> FastAPI:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SIH26037 — Unstructured Indian Road Adaptive Autonomous Stack</title>
+    <title>SIH26037 — Real IDD Perception & Autonomous Motion Visualizer</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { background-color: #070b13; color: #e2e8f0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -532,14 +535,14 @@ def create_app() -> FastAPI:
         <div>
             <div class="inline-flex items-center gap-2 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 mb-1">
                 <span class="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></span>
-                SIH26037 • UNSTRUCTURED INDIAN ROAD CORRIDOR
+                SIH26037 • REAL IDD PERCEPTION & KALMAN TRACKER
             </div>
             <h1 class="text-xl md:text-2xl font-black tracking-tight text-white flex items-center gap-3">
-                Adaptive Free-Space Navigation & Anomaly Avoidance
+                Indian-Trained Perception Stack & Autonomous Planning
                 <span id="badge-difficulty" class="text-xs px-2.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono font-bold">HARD TIER</span>
             </h1>
             <p class="text-xs text-slate-400 mt-0.5">
-                Real Unstructured Road: Non-rectangular irregular boundaries • Variable width (3.4m choke to 5.6m bay) • Potholes & Craters • Speed Bumps • Unpaved Shoulder Ditches • 7-Path Bundle Planner.
+                Sense-to-Control Pipeline: Camera Frame → IDD Object Detection → 3D Bounding Box → Persistent MOT Track ID → Kalman Velocity Filter → FreeSpace Corridor → Candidate Splines.
             </p>
         </div>
 
@@ -550,6 +553,12 @@ def create_app() -> FastAPI:
                 <option value="MEDIUM">Medium (Boulder & Auto)</option>
                 <option value="HARD" selected>Hard (Oncoming Tractor & Pedestrian)</option>
                 <option value="EXTREME">Extreme (Wide Tractor & Darting Ped)</option>
+            </select>
+
+            <!-- Perception Mode Switcher -->
+            <select id="perc-select" onchange="changePerceptionMode(this.value)" class="bg-cyan-950/80 border border-cyan-700 text-xs text-cyan-200 rounded-lg px-2.5 py-2 font-mono font-bold">
+                <option value="NEURAL_IDD" selected>🤖 Perception: Neural IDD + EKF</option>
+                <option value="GROUND_TRUTH">⚙️ Perception: Ground Truth Sim</option>
             </select>
 
             <!-- View Switcher -->
@@ -574,22 +583,22 @@ def create_app() -> FastAPI:
         <div class="flex items-center justify-between">
             <span class="text-xs font-bold uppercase tracking-wider text-cyan-400 flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
-                Sense-Predict-Plan-Act Causal Arbiter
+                End-to-End Perception & Causal Decision Chain
             </span>
             <span id="causal-summary-badge" class="text-xs font-mono font-bold px-3 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-500/40">
-                CRUISING FREE-SPACE CORRIDOR
+                PERCEPTION ACTIVE — CRUISING
             </span>
         </div>
 
         <!-- 5-Stage Causal Flow Stepper -->
         <div class="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs font-mono">
             <div id="step-1" class="chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800">
-                <span class="text-[10px] text-slate-500 font-sans block uppercase">1. Hazard Incursion</span>
+                <span class="text-[10px] text-slate-500 font-sans block uppercase">1. IDD Perception</span>
                 <span id="hud-hazard" class="font-bold text-slate-300 block truncate">None Detected</span>
-                <span id="hud-hazard-dist" class="text-[10px] text-slate-500">Range: --</span>
+                <span id="hud-hazard-dist" class="text-[10px] text-slate-500">Track ID: --</span>
             </div>
             <div id="step-2" class="chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800">
-                <span class="text-[10px] text-slate-500 font-sans block uppercase">2. Intent & TTC</span>
+                <span class="text-[10px] text-slate-500 font-sans block uppercase">2. Kalman Velocity & TTC</span>
                 <span id="hud-ttc" class="font-bold text-slate-300 block">TTC > 4.0s (Safe)</span>
                 <span id="hud-risk" class="text-[10px] text-slate-500">Nominal: VALID</span>
             </div>
@@ -619,7 +628,7 @@ def create_app() -> FastAPI:
                 <div class="flex items-center gap-2">
                     <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
                     <span class="font-bold uppercase tracking-wider text-slate-200">
-                        Unstructured Road Debug Canvas (BEV)
+                        Autonomous Driving Debug Canvas (BEV)
                     </span>
                     <span id="view-mode-tag" class="px-2 py-0.5 rounded text-[10px] font-mono bg-cyan-950 text-cyan-300 border border-cyan-800">
                         EGO COCKPIT (30M AHEAD)
@@ -631,17 +640,17 @@ def create_app() -> FastAPI:
 
                 <!-- Interactive Hazard Injection Bar -->
                 <div class="flex items-center gap-1.5">
-                    <span class="text-[11px] text-slate-400 font-bold">Inject Hazard:</span>
-                    <button onclick="spawnHazard('tractor')" class="px-2 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-[11px] font-bold transition">
+                    <span class="text-[11px] text-slate-400 font-bold">Inject:</span>
+                    <button onclick="spawnHazard('tractor')" class="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-[11px] font-bold transition">
                         🚜 Tractor
                     </button>
-                    <button onclick="spawnHazard('pedestrian')" class="px-2 py-1 rounded bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 text-[11px] font-bold transition">
+                    <button onclick="spawnHazard('pedestrian')" class="px-2.5 py-1 rounded bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 text-[11px] font-bold transition">
                         🚶 Villager
                     </button>
-                    <button onclick="spawnHazard('auto')" class="px-2 py-1 rounded bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 border border-orange-500/40 text-[11px] font-bold transition">
+                    <button onclick="spawnHazard('auto')" class="px-2.5 py-1 rounded bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 border border-orange-500/40 text-[11px] font-bold transition">
                         🛺 Auto
                     </button>
-                    <button onclick="spawnHazard('pothole')" class="px-2 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/40 text-[11px] font-bold transition">
+                    <button onclick="spawnHazard('pothole')" class="px-2.5 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/40 text-[11px] font-bold transition">
                         🕳️ Pothole
                     </button>
                 </div>
@@ -680,9 +689,9 @@ def create_app() -> FastAPI:
                     <span class="text-[9px] text-slate-500 font-semibold">Front Wheel</span>
                 </div>
                 <div class="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
-                    <span class="text-[10px] text-slate-400 font-bold uppercase block">Road Width</span>
-                    <span id="kpi-width" class="text-xl font-black text-indigo-400 font-mono">4.3 m</span>
-                    <span class="text-[9px] text-slate-500 font-semibold">Variable Corridor</span>
+                    <span class="text-[10px] text-slate-400 font-bold uppercase block">Perception Tracks</span>
+                    <span id="kpi-tracks" class="text-xl font-black text-cyan-300 font-mono">0</span>
+                    <span class="text-[9px] text-slate-500 font-semibold">Persistent MOT</span>
                 </div>
                 <div class="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
                     <span class="text-[10px] text-slate-400 font-bold uppercase block">Ditch Margin</span>
@@ -691,13 +700,13 @@ def create_app() -> FastAPI:
                 </div>
             </div>
 
-            <!-- Threat Radar Feed -->
+            <!-- Threat Radar Feed with Persistent Tracks -->
             <div class="space-y-2">
                 <div class="flex items-center justify-between border-t border-slate-800 pt-2">
                     <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300">
-                        Perception & Dynamic Threats
+                        IDD Perception & Track States
                     </h3>
-                    <span class="text-[10px] text-cyan-400 font-mono">20 Hz Track</span>
+                    <span class="text-[10px] text-cyan-400 font-mono">20 Hz Sense</span>
                 </div>
                 
                 <div id="actors-list" class="space-y-2 text-xs max-h-40 overflow-y-auto pr-1">
@@ -732,7 +741,7 @@ def create_app() -> FastAPI:
         const canvas = document.getElementById('simCanvas');
         const ctx = canvas.getContext('2d');
         let currentData = null;
-        let viewMode = 'ego'; // 'ego' (30m ahead top-down) or 'road' (world horizontal track)
+        let viewMode = 'ego';
 
         function toggleViewMode() {
             viewMode = viewMode === 'ego' ? 'road' : 'ego';
@@ -759,7 +768,7 @@ def create_app() -> FastAPI:
             if (!data || !data.ego) return;
             document.getElementById('kpi-speed').innerText = data.ego.speed_kph;
             document.getElementById('kpi-steer').innerText = `${data.ego.steer_deg}°`;
-            document.getElementById('kpi-width').innerText = `${data.road.current_width_m} m`;
+            document.getElementById('kpi-tracks').innerText = (data.actors || []).length;
             document.getElementById('kpi-margin').innerText = `${data.road.current_margin_m} m`;
 
             const widthBadge = document.getElementById('road-width-badge');
@@ -777,6 +786,10 @@ def create_app() -> FastAPI:
             if (data.difficulty) {
                 document.getElementById('badge-difficulty').innerText = `${data.difficulty} TIER`;
                 document.getElementById('diff-select').value = data.difficulty;
+            }
+
+            if (data.perception && data.perception.mode) {
+                document.getElementById('perc-select').value = data.perception.mode;
             }
 
             const btnToggle = document.getElementById('btn-toggle');
@@ -816,7 +829,7 @@ def create_app() -> FastAPI:
             } else {
                 [s1, s2, s3, s4, s5].forEach(el => el.className = 'chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800');
                 document.getElementById('hud-hazard').innerText = 'None Detected';
-                document.getElementById('hud-hazard-dist').innerText = 'Range: Clear';
+                document.getElementById('hud-hazard-dist').innerText = 'Track ID: Clear';
                 document.getElementById('hud-ttc').innerText = 'TTC > 4.0s (Safe)';
                 document.getElementById('hud-risk').innerText = 'Nominal: VALID';
                 document.getElementById('hud-candidates').innerText = '7 Evaluated';
@@ -827,10 +840,10 @@ def create_app() -> FastAPI:
                 document.getElementById('hud-speed-act').innerText = `Speed: ${data.ego.speed_kph} km/h`;
 
                 document.getElementById('causal-summary-badge').className = 'text-xs font-mono font-bold px-3 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-500/40';
-                document.getElementById('causal-summary-badge').innerText = 'CRUISING FREE-SPACE CORRIDOR';
+                document.getElementById('causal-summary-badge').innerText = 'PERCEPTION ACTIVE — CRUISING';
             }
 
-            // Update Actors List
+            // Update Actors List with Persistent Track IDs & Confidence
             const listEl = document.getElementById('actors-list');
             listEl.innerHTML = '';
             (data.actors || []).forEach(a => {
@@ -844,7 +857,7 @@ def create_app() -> FastAPI:
                         <span class="text-slate-200 font-mono">${a.id}</span>
                         <div class="flex items-center gap-1">
                             ${ttcBadge}
-                            <span class="text-[10px] px-1.5 py-0.2 rounded ${a.is_static ? 'bg-slate-800 text-slate-400' : 'bg-cyan-900/50 text-cyan-300'}">${a.class}</span>
+                            <span class="text-[10px] px-1.5 py-0.2 rounded bg-cyan-900/60 text-cyan-300 font-mono">${Math.round((a.confidence || 0.95)*100)}% ${a.class}</span>
                         </div>
                     </div>
                     <div class="flex justify-between text-[10px] text-slate-400 font-mono">
@@ -916,7 +929,7 @@ def create_app() -> FastAPI:
 
             const originX = w / 2;
             const originY = h - 90;
-            const scale = 11.5; // pixels per meter
+            const scale = 11.5;
 
             function worldToScreen(wx, wy) {
                 const dx = wx - egoX;
@@ -960,10 +973,9 @@ def create_app() -> FastAPI:
             });
             ctx.setLineDash([]);
 
-            // 2. Unstructured Organic Road Surface (Non-Rectangular Polygon)
+            // 2. Unstructured Organic Road Surface
             const poly = data.road.polyline || [];
             if (poly.length > 2) {
-                // Shaded asphalt surface
                 ctx.fillStyle = '#161e2e';
                 ctx.beginPath();
                 let started = false;
@@ -992,7 +1004,7 @@ def create_app() -> FastAPI:
                 ctx.stroke();
                 ctx.setLineDash([]);
 
-                // Irregular Left Road Edge (Yellow with Ditch Hazard Hatching)
+                // Left Edge
                 ctx.strokeStyle = '#eab308';
                 ctx.lineWidth = 2.5;
                 ctx.beginPath();
@@ -1003,7 +1015,7 @@ def create_app() -> FastAPI:
                 });
                 ctx.stroke();
 
-                // Irregular Right Road Edge
+                // Right Edge
                 ctx.strokeStyle = '#eab308';
                 ctx.lineWidth = 2.5;
                 ctx.beginPath();
@@ -1020,12 +1032,10 @@ def create_app() -> FastAPI:
                 for (let i = 0; i < poly.length; i += 2) {
                     const lScr = worldToScreen(poly[i].lx, poly[i].ly);
                     const rScr = worldToScreen(poly[i].rx, poly[i].ry);
-                    // Left shoulder tick
                     ctx.beginPath();
                     ctx.moveTo(lScr.sx, lScr.sy);
                     ctx.lineTo(lScr.sx - 8, lScr.sy - 4);
                     ctx.stroke();
-                    // Right shoulder tick
                     ctx.beginPath();
                     ctx.moveTo(rScr.sx, rScr.sy);
                     ctx.lineTo(rScr.sx + 8, rScr.sy - 4);
@@ -1039,7 +1049,6 @@ def create_app() -> FastAPI:
                 const rPix = an.radius_m * scale;
 
                 if (an.type === 'POTHOLE') {
-                    // Dark crater with red/amber warning halo
                     ctx.fillStyle = '#0f172a';
                     ctx.strokeStyle = '#ef4444';
                     ctx.lineWidth = 2.0;
@@ -1048,7 +1057,6 @@ def create_app() -> FastAPI:
                     ctx.fill();
                     ctx.stroke();
 
-                    // Inner depth ring
                     ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
                     ctx.lineWidth = 1.0;
                     ctx.beginPath();
@@ -1059,7 +1067,6 @@ def create_app() -> FastAPI:
                     ctx.font = 'bold 8px monospace';
                     ctx.fillText(`🕳️ ${Math.round(an.depth_or_height_m * 100)}cm`, scr.sx + rPix + 3, scr.sy + 3);
                 } else if (an.type === 'SPEED_BUMP') {
-                    // Transverse yellow warning stripe
                     ctx.strokeStyle = '#fde047';
                     ctx.lineWidth = 4.0;
                     ctx.beginPath();
@@ -1071,7 +1078,6 @@ def create_app() -> FastAPI:
                     ctx.font = 'bold 8px monospace';
                     ctx.fillText(`⚠️ BUMP (+${Math.round(an.depth_or_height_m * 100)}cm)`, scr.sx + rPix * 1.5 + 4, scr.sy + 3);
                 } else if (an.type === 'GRAVEL') {
-                    // Non-drivable gravel heap
                     ctx.fillStyle = 'rgba(249, 115, 22, 0.35)';
                     ctx.strokeStyle = '#f97316';
                     ctx.lineWidth = 1.8;
@@ -1098,7 +1104,6 @@ def create_app() -> FastAPI:
                 ctx.stroke();
                 ctx.setLineDash([]);
 
-                // Target Crosshair
                 ctx.strokeStyle = '#eab308';
                 ctx.fillStyle = 'rgba(234, 179, 8, 0.25)';
                 ctx.lineWidth = 2.0;
@@ -1117,7 +1122,7 @@ def create_app() -> FastAPI:
                 ctx.fillText(`🎯 GOAL: +${data.goal.distance_ahead_m}m`, gScr.sx + 14, gScr.sy + 3);
             }
 
-            // 5. Candidate Ego Trajectories (7-Spline Bundle adapting to variable width & craters)
+            // 5. Candidate Ego Trajectories (7-Spline Bundle)
             (data.candidates || []).forEach(cand => {
                 if (!cand.waypoints || cand.waypoints.length === 0) return;
                 ctx.beginPath();
@@ -1129,7 +1134,7 @@ def create_app() -> FastAPI:
                 });
 
                 if (cand.is_selected) {
-                    ctx.strokeStyle = '#10b981'; // Glowing green
+                    ctx.strokeStyle = '#10b981';
                     ctx.lineWidth = 4.0;
                     ctx.shadowColor = '#10b981';
                     ctx.shadowBlur = 10;
@@ -1147,13 +1152,13 @@ def create_app() -> FastAPI:
                         }
                     });
                 } else if (cand.is_feasible) {
-                    ctx.strokeStyle = 'rgba(6, 182, 212, 0.40)'; // Cyan for clear alternatives
+                    ctx.strokeStyle = 'rgba(6, 182, 212, 0.40)';
                     ctx.lineWidth = 1.8;
                     ctx.setLineDash([4, 4]);
                     ctx.stroke();
                     ctx.setLineDash([]);
                 } else {
-                    ctx.strokeStyle = 'rgba(239, 68, 68, 0.55)'; // Dashed red for collision/ditch breach
+                    ctx.strokeStyle = 'rgba(239, 68, 68, 0.55)';
                     ctx.lineWidth = 1.8;
                     ctx.setLineDash([3, 4]);
                     ctx.stroke();
@@ -1220,10 +1225,10 @@ def create_app() -> FastAPI:
                 });
             });
 
-            // 8. Obstacles with Velocity Vectors & Bounding Boxes
+            // 8. Obstacles with IDD Track Labels & Velocity Vectors
             (data.actors || []).forEach(a => {
                 const scr = worldToScreen(a.x_world, a.y_world);
-                const relHeading = (a.yaw_world_deg - ego.heading_deg) * Math.PI / 180;
+                const relHeading = ((a.yaw_deg || 0) - ego.heading_deg) * Math.PI / 180;
 
                 ctx.save();
                 ctx.translate(scr.sx, scr.sy);
@@ -1273,7 +1278,7 @@ def create_app() -> FastAPI:
                 // Velocity Vector Arrow
                 if (a.speed_mps > 0.2) {
                     const vLenPix = a.speed_mps * 3.5 * scale * 0.2;
-                    const vAngle = Math.atan2(a.vy_world, a.vx_world) - egoHeading;
+                    const vAngle = Math.atan2(a.vy_ego || 0, a.vx_ego || 0);
                     const vEndSx = scr.sx + vLenPix * Math.sin(vAngle);
                     const vEndSy = scr.sy - vLenPix * Math.cos(vAngle);
 
@@ -1291,7 +1296,7 @@ def create_app() -> FastAPI:
 
                     ctx.fillStyle = '#fef08a';
                     ctx.font = 'bold 9px monospace';
-                    ctx.fillText(`${a.speed_mps}m/s (${a.speed_kph}kph)`, vEndSx + 5, vEndSy - 2);
+                    ctx.fillText(`${a.speed_mps}m/s`, vEndSx + 5, vEndSy - 2);
                 }
 
                 ctx.fillStyle = '#e2e8f0';
@@ -1471,6 +1476,14 @@ def create_app() -> FastAPI:
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ difficulty: level })
+            });
+        }
+
+        async function changePerceptionMode(mode) {
+            await fetch('/simulation/perception_mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mode: mode })
             });
         }
     </script>
