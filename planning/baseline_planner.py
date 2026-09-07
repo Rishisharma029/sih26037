@@ -42,6 +42,7 @@ class BaselinePlanner:
         self.safety_dist_m = safety_dist_m
         self.vehicle_half_width = vehicle_half_width
         self.plan_counter = 0
+        self.last_candidates_summary: List[dict] = []
 
     def plan(
         self,
@@ -52,6 +53,7 @@ class BaselinePlanner:
     ) -> PlannedTrajectory:
         """Generates candidate offset trajectories and selects the optimal feasible path."""
         self.plan_counter += 1
+        self.last_candidates_summary = []
 
         current_x = ego_state.pose.position.x
         current_y = ego_state.pose.position.y
@@ -68,15 +70,25 @@ class BaselinePlanner:
         d_right_limit = -corridor_half_w + self.vehicle_half_width
 
         scored_candidates: List[Tuple[float, float, List[TrajectoryPoint], BehaviorMode]] = []
+        raw_candidates_info: List[dict] = []
 
         # 1. Generate and evaluate each lateral offset candidate
         for offset in self.lateral_offsets:
             # Check if target offset is within drivable road corridor
             if offset > d_left_limit or offset < d_right_limit:
+                raw_candidates_info.append({
+                    "offset": offset,
+                    "is_feasible": False,
+                    "is_selected": False,
+                    "cost": 9999.0,
+                    "rejection_reason": "CORRIDOR_BREACH",
+                    "waypoints": []
+                })
                 continue
 
             waypoints: List[TrajectoryPoint] = []
             is_collision = False
+            collision_obs_id = ""
 
             for i in range(1, num_steps + 1):
                 t = i * self.dt
@@ -124,6 +136,7 @@ class BaselinePlanner:
                     # Collision checking using longitudinal and lateral footprints
                     if dx < (1.5 + obs_half_l + 0.2) and dy < (self.vehicle_half_width + obs_half_w + 0.1):
                         is_collision = True
+                        collision_obs_id = obs.id
                         break
 
                 if is_collision:
@@ -141,7 +154,7 @@ class BaselinePlanner:
                 ))
 
             if not is_collision and len(waypoints) == num_steps:
-                # Candidate Cost = |offset| * 2.0 + (lateral deviation penalty)
+                # Candidate Cost = |offset| * 2.5 + (deviation penalty)
                 cost = abs(offset) * 2.5 + (0.5 if offset != 0.0 else 0.0)
 
                 if offset > 0.25:
@@ -152,12 +165,37 @@ class BaselinePlanner:
                     mode = BehaviorMode.CRUISE
 
                 scored_candidates.append((cost, offset, waypoints, mode))
+                raw_candidates_info.append({
+                    "offset": offset,
+                    "is_feasible": True,
+                    "is_selected": False,
+                    "cost": round(cost, 2),
+                    "mode": mode.value,
+                    "rejection_reason": "CLEAR",
+                    "waypoints": [{"x": wp.x, "y": wp.y} for wp in waypoints]
+                })
+            else:
+                raw_candidates_info.append({
+                    "offset": offset,
+                    "is_feasible": False,
+                    "is_selected": False,
+                    "cost": 9999.0,
+                    "mode": "COLLISION",
+                    "rejection_reason": f"COLLISION ({collision_obs_id})" if collision_obs_id else "INCOMPLETE",
+                    "waypoints": [{"x": wp.x, "y": wp.y} for wp in waypoints]
+                })
 
         # 2. Select optimal feasible candidate
         if scored_candidates:
             # Sort by cost ascending (prefers center offset 0.0m if clear, otherwise minimal nudge)
             scored_candidates.sort(key=lambda x: x[0])
             best_cost, best_offset, best_wps, best_mode = scored_candidates[0]
+
+            for cand in raw_candidates_info:
+                if cand["offset"] == best_offset and cand["is_feasible"]:
+                    cand["is_selected"] = True
+
+            self.last_candidates_summary = raw_candidates_info
 
             return PlannedTrajectory(
                 trajectory_id=f"baseline_opt_{self.plan_counter}_offset_{best_offset:+.1f}",
@@ -170,6 +208,7 @@ class BaselinePlanner:
             )
 
         # 3. Fallback: All lateral offsets are blocked -> execute safe emergency stop directly ahead
+        self.last_candidates_summary = raw_candidates_info
         fallback_wps: List[TrajectoryPoint] = []
         speed_decay = current_speed
         for i in range(1, num_steps + 1):

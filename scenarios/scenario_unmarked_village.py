@@ -108,6 +108,57 @@ class UnmarkedVillageRoadScenario(BaseScenario):
             self.env.add_actor(auto)
             self.env.add_anomaly(pothole)
 
+    def spawn_oncoming_tractor(self, dist_ahead: float = 35.0, y: float = 0.8, speed_mps: float = 3.5):
+        """Dynamically inject an oncoming agricultural tractor entering ego lane."""
+        ego_x = self.simulator.state.pose.position.x
+        tractor = SimulationActor(
+            id=f"oncoming_tractor_{len(self.env.actors)+1}",
+            obstacle_class=ObstacleClass.TRUCK,
+            x=ego_x + dist_ahead,
+            y=y,
+            speed_mps=-abs(speed_mps),
+            yaw_rad=math.pi,
+            length_m=4.5,
+            width_m=2.1,
+            is_static=False
+        )
+        self.env.add_actor(tractor)
+        return tractor
+
+    def spawn_crossing_pedestrian(self, dist_ahead: float = 20.0, start_y: float = -2.2, speed_mps: float = 1.4):
+        """Dynamically inject a villager darting across the road."""
+        ego_x = self.simulator.state.pose.position.x
+        ped = SimulationActor(
+            id=f"crossing_villager_{len(self.env.actors)+1}",
+            obstacle_class=ObstacleClass.PEDESTRIAN,
+            x=ego_x + dist_ahead,
+            y=start_y,
+            speed_mps=abs(speed_mps),
+            yaw_rad=math.pi / 2.0,
+            length_m=0.5,
+            width_m=0.5,
+            is_static=False
+        )
+        self.env.add_actor(ped)
+        return ped
+
+    def spawn_parked_auto(self, dist_ahead: float = 18.0, y: float = 0.9):
+        """Dynamically inject a parked auto rickshaw partially blocking the lane."""
+        ego_x = self.simulator.state.pose.position.x
+        auto = SimulationActor(
+            id=f"parked_auto_{len(self.env.actors)+1}",
+            obstacle_class=ObstacleClass.AUTO_RICKSHAW,
+            x=ego_x + dist_ahead,
+            y=y,
+            speed_mps=0.0,
+            yaw_rad=0.0,
+            length_m=2.6,
+            width_m=1.4,
+            is_static=True
+        )
+        self.env.add_actor(auto)
+        return auto
+
 
 def build_unmarked_village_environment() -> RoadEnvironment:
     """Helper for testing and quick baseline instantiation."""
