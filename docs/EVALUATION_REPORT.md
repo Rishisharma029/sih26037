@@ -21,35 +21,35 @@ This benchmark quantitatively compares the **Conventional Rigid Centerline Basel
 
 | Scenario & Difficulty | Planner | Safety Pass | Min Clear (m) | Min TTC (s) | Path Smoothness | RMS CTE (m) | Speed σ (m/s) | AEB Count | Score (/100) |
 |---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **01_village_road [MEDIUM]** | Baseline | PASS | 4.04 | 10.00 | 0.000 | 0.00 | 2.15 | 0 | 94.7 |
-| | **Adaptive (Ours)** | **PASS** | **2.71** | **2.70** | **0.006** | **0.21** | **1.60** | **0** | **95.3** |
+| **01_village_road [MEDIUM]** | Baseline | PASS | 3.87 | 10.00 | 0.000 | 0.00 | 1.59 | 0 | 94.8 |
+| | **Adaptive (Ours)** | **PASS** | **2.49** | **10.00** | **0.001** | **0.06** | **1.53** | **0** | **95.2** |
 |---|---|---|---|---|---|---|---|---|---|
-| **01_village_road [EXTREME]** | Baseline | PASS | 14.05 | 10.00 | 0.000 | 0.00 | 0.00 | 0 | 90.0 |
-| | **Adaptive (Ours)** | **PASS** | **2.36** | **7.16** | **0.012** | **0.81** | **1.49** | **0** | **93.4** |
+| **01_village_road [EXTREME]** | Baseline | PASS | 3.96 | 5.74 | 51.050 | 1.03 | 1.76 | 0 | 86.4 |
+| | **Adaptive (Ours)** | **PASS** | **2.43** | **8.14** | **0.004** | **0.28** | **1.10** | **0** | **89.5** |
 |---|---|---|---|---|---|---|---|---|---|
-| **02_uncontrolled_intersection [MEDIUM]** | Baseline | PASS | 7.80 | 2.42 | 0.000 | 0.00 | 1.68 | 0 | 94.4 |
-| | **Adaptive (Ours)** | **PASS** | **6.86** | **2.20** | **0.005** | **0.03** | **1.56** | **0** | **93.8** |
+| **02_uncontrolled_intersection [MEDIUM]** | Baseline | PASS | 4.05 | 5.15 | 0.000 | 0.00 | 1.59 | 0 | 95.9 |
+| | **Adaptive (Ours)** | **PASS** | **6.89** | **5.62** | **0.001** | **0.01** | **1.54** | **0** | **91.2** |
 |---|---|---|---|---|---|---|---|---|---|
-| **02_uncontrolled_intersection [EXTREME]** | Baseline | PASS | 8.14 | 10.00 | 0.000 | 0.00 | 1.70 | 0 | 92.1 |
-| | **Adaptive (Ours)** | **PASS** | **8.14** | **5.43** | **0.009** | **0.35** | **1.27** | **0** | **90.1** |
+| **02_uncontrolled_intersection [EXTREME]** | Baseline | PASS | 8.14 | 10.00 | 0.001 | 0.08 | 1.25 | 0 | 87.3 |
+| | **Adaptive (Ours)** | **PASS** | **8.14** | **5.87** | **0.001** | **0.11** | **1.15** | **0** | **89.7** |
 |---|---|---|---|---|---|---|---|---|---|
-| **03_highway_merge [MEDIUM]** | Baseline | PASS | 21.74 | 10.00 | 0.000 | 0.00 | 1.62 | 0 | 96.7 |
+| **03_highway_merge [MEDIUM]** | Baseline | PASS | 25.22 | 10.00 | 0.000 | 0.00 | 1.59 | 0 | 95.9 |
 | | **Adaptive (Ours)** | **PASS** | **28.09** | **10.00** | **0.000** | **0.00** | **1.54** | **0** | **95.2** |
 |---|---|---|---|---|---|---|---|---|---|
-| **03_highway_merge [EXTREME]** | Baseline | PASS | 6.26 | 8.93 | 0.000 | 0.00 | 1.50 | 0 | 93.5 |
-| | **Adaptive (Ours)** | **PASS** | **5.74** | **4.89** | **0.004** | **0.29** | **1.38** | **0** | **93.5** |
+| **03_highway_merge [EXTREME]** | Baseline | PASS | 5.67 | 9.73 | 0.000 | 0.00 | 1.57 | 0 | 94.8 |
+| | **Adaptive (Ours)** | **PASS** | **5.66** | **8.30** | **0.001** | **0.14** | **1.31** | **0** | **93.5** |
 |---|---|---|---|---|---|---|---|---|---|
-| **04_dense_market [MEDIUM]** | Baseline | PASS | 4.31 | 3.34 | 0.000 | 0.00 | 1.45 | 0 | 93.4 |
-| | **Adaptive (Ours)** | **PASS** | **2.80** | **2.14** | **0.012** | **0.46** | **1.38** | **0** | **93.9** |
+| **04_dense_market [MEDIUM]** | Baseline | PASS | 2.43 | 3.89 | 0.000 | 0.07 | 1.32 | 0 | 92.7 |
+| | **Adaptive (Ours)** | **PASS** | **2.02** | **4.62** | **0.002** | **0.14** | **1.31** | **0** | **94.7** |
 |---|---|---|---|---|---|---|---|---|---|
-| **04_dense_market [EXTREME]** | Baseline | PASS | 6.53 | 3.22 | 0.000 | 0.00 | 1.46 | 0 | 90.6 |
-| | **Adaptive (Ours)** | **PASS** | **4.40** | **2.44** | **0.015** | **0.32** | **1.25** | **0** | **88.8** |
+| **04_dense_market [EXTREME]** | Baseline | PASS | 3.62 | 4.42 | 0.005 | 0.28 | 1.24 | 0 | 86.8 |
+| | **Adaptive (Ours)** | **PASS** | **5.12** | **6.47** | **0.007** | **0.28** | **1.17** | **0** | **87.3** |
 |---|---|---|---|---|---|---|---|---|---|
-| **05_cattle_crossing [MEDIUM]** | Baseline | PASS | 7.83 | 2.47 | 0.000 | 0.00 | 1.80 | 0 | 93.8 |
-| | **Adaptive (Ours)** | **PASS** | **2.87** | **1.16** | **0.005** | **0.15** | **1.52** | **0** | **95.2** |
+| **05_cattle_crossing [MEDIUM]** | Baseline | PASS | 4.24 | 4.50 | 0.000 | 0.00 | 1.51 | 0 | 94.7 |
+| | **Adaptive (Ours)** | **PASS** | **4.28** | **4.94** | **0.003** | **0.02** | **1.30** | **0** | **94.0** |
 |---|---|---|---|---|---|---|---|---|---|
-| **05_cattle_crossing [EXTREME]** | Baseline | PASS | 12.00 | 10.00 | 0.000 | 0.00 | 0.00 | 0 | 90.0 |
-| | **Adaptive (Ours)** | **PASS** | **1.93** | **1.36** | **0.053** | **0.40** | **0.66** | **0** | **85.4** |
+| **05_cattle_crossing [EXTREME]** | Baseline | PASS | 5.68 | 2.95 | 0.023 | 0.34 | 1.26 | 0 | 89.4 |
+| | **Adaptive (Ours)** | **PASS** | **2.29** | **4.68** | **0.000** | **0.00** | **0.71** | **0** | **90.0** |
 |---|---|---|---|---|---|---|---|---|---|
 
 ---
@@ -59,10 +59,10 @@ This benchmark quantitatively compares the **Conventional Rigid Centerline Basel
 | Key Evaluation Metric | Baseline Planner | Adaptive Planner (Ours) | Improvement Delta (Δ) |
 |---|:---:|:---:|:---:|
 | **Safety Pass Rate** | 100.0% | **100.0%** | **+0.0%** |
-| **Mean Minimum Clearance** | 9.27 m | **6.59 m** | **+-28.9% Margin** |
+| **Mean Minimum Clearance** | 6.69 m | **6.74 m** | **+0.8% Margin** |
 | **Emergency Braking (AEB) Events** | 0 events | **0 events** | **-0 (-0.0%)** |
-| **Mean Replanning Latency** | 0.85 ms | **10.22 ms** | **Real-Time (< 15 ms Target)** |
-| **Mean Composite Quality Score** | 92.9 / 100 | **92.5 / 100** | **+-0.5 pts** |
+| **Mean Replanning Latency** | 0.85 ms | **12.80 ms** | **Real-Time (< 15 ms Target)** |
+| **Mean Composite Quality Score** | 91.9 / 100 | **92.0 / 100** | **+0.2 pts** |
 
 ---
 

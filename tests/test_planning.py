@@ -174,3 +174,90 @@ def test_cost_evaluator_uncertainty_penalty():
 
     assert score_near.cost_breakdown["uncertainty"] > score_far.cost_breakdown["uncertainty"]
     assert score_near.total_cost > score_far.total_cost
+
+
+def test_baseline_planner_candidate_offsets_clear():
+    """Verify BaselinePlanner selects center cruise (0.0m offset) when road is clear."""
+    from planning.baseline_planner import BaselinePlanner
+    planner = BaselinePlanner(horizon_seconds=3.0, dt=0.2)
+    ego = _create_mock_ego(speed=6.0)
+    perc = PerceptionOutput(
+        timestamp=10.0, frame_id=1, obstacles=[],
+        drivable_corridor=FreeSpaceCorridor(timestamp=10.0, boundary_points=[], average_width_m=7.0)
+    )
+    pred = PredictionOutput(timestamp=10.0, horizon_seconds=3.0, agents=[])
+    
+    plan = planner.plan(ego, perc, pred, target_cruise_speed_mps=6.0)
+    assert plan.is_feasible
+    assert plan.behavior_mode == BehaviorMode.CRUISE
+    assert abs(plan.waypoints[-1].y) < 0.2
+    assert len(plan.waypoints) == 15
+
+
+def test_baseline_planner_candidate_offsets_nudge_left():
+    """Verify BaselinePlanner selects positive offset (NUDGE_LEFT) when center is blocked."""
+    from planning.baseline_planner import BaselinePlanner
+    planner = BaselinePlanner(horizon_seconds=3.0, dt=0.2)
+    ego = _create_mock_ego(x=0.0, y=0.0, speed=6.0)
+    
+    # Center blocked at x=15, y=0.0 by motorcycle
+    obs_center = TrackedObstacle(
+        id="block_center",
+        obstacle_class=ObstacleClass.MOTORCYCLE,
+        confidence=0.9,
+        bbox=BoundingBox3D(center=Point3D(x=15.0, y=0.0, z=0.5), size=Vector3D(x=1.8, y=0.6, z=1.2)),
+        velocity=Vector3D(x=0.0, y=0.0, z=0.0),
+        distance_m=15.0,
+        is_static=True
+    )
+    # Also block right side at x=15, y=-1.0
+    obs_right = TrackedObstacle(
+        id="block_right",
+        obstacle_class=ObstacleClass.STATIC_DEBRIS,
+        confidence=0.9,
+        bbox=BoundingBox3D(center=Point3D(x=15.0, y=-1.0, z=0.3), size=Vector3D(x=1.5, y=0.8, z=0.6)),
+        velocity=Vector3D(x=0.0, y=0.0, z=0.0),
+        distance_m=15.0,
+        is_static=True
+    )
+    perc = PerceptionOutput(
+        timestamp=10.0, frame_id=1, obstacles=[obs_center, obs_right],
+        drivable_corridor=FreeSpaceCorridor(timestamp=10.0, boundary_points=[], average_width_m=7.0)
+    )
+    pred = PredictionOutput(timestamp=10.0, horizon_seconds=3.0, agents=[])
+    
+    plan = planner.plan(ego, perc, pred, target_cruise_speed_mps=6.0)
+    assert plan.is_feasible
+    assert plan.behavior_mode == BehaviorMode.NUDGE_LEFT
+    assert plan.waypoints[-1].y > 0.4
+
+
+def test_baseline_planner_candidate_offsets_emergency_stop():
+    """Verify BaselinePlanner triggers emergency stop when road is completely wall-blocked."""
+    from planning.baseline_planner import BaselinePlanner
+    planner = BaselinePlanner(horizon_seconds=3.0, dt=0.2)
+    ego = _create_mock_ego(x=0.0, y=0.0, speed=6.0)
+    
+    # Complete wall at x=10 across y=-3.0 to +3.0
+    wall_obstacles = [
+        TrackedObstacle(
+            id=f"wall_{i}",
+            obstacle_class=ObstacleClass.STATIC_DEBRIS,
+            confidence=0.9,
+            bbox=BoundingBox3D(center=Point3D(x=10.0, y=y_val, z=0.5), size=Vector3D(x=2.0, y=1.2, z=1.0)),
+            velocity=Vector3D(x=0.0, y=0.0, z=0.0),
+            distance_m=10.0,
+            is_static=True
+        )
+        for i, y_val in enumerate([-2.0, -1.0, 0.0, 1.0, 2.0])
+    ]
+    perc = PerceptionOutput(
+        timestamp=10.0, frame_id=1, obstacles=wall_obstacles,
+        drivable_corridor=FreeSpaceCorridor(timestamp=10.0, boundary_points=[], average_width_m=7.0)
+    )
+    pred = PredictionOutput(timestamp=10.0, horizon_seconds=3.0, agents=[])
+    
+    plan = planner.plan(ego, perc, pred, target_cruise_speed_mps=6.0)
+    assert plan.behavior_mode == BehaviorMode.EMERGENCY_STOP
+    assert plan.waypoints[-1].speed_mps == 0.0
+
