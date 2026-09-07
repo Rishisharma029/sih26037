@@ -5,8 +5,8 @@ into persistent WorldModel tracks.
 """
 import math
 from typing import List, Dict, Any, Optional
-from interfaces import RawSensorFrame, PerceptionOutput, FreeSpaceCorridor, EgoVehicleState, Point3D, Vector3D, ObstacleClass
-from simulation.sensor_sim import CameraDetection, LidarCluster, RadarTarget
+from interfaces import ObstacleClass, EgoVehicleState, PerceptionOutput, RawSensorFrame, Vector3D, Point3D
+from .types import CameraDetection, LidarCluster, RadarTarget
 from .boundary_detector import FreeSpaceBoundaryDetector
 from .world_model import WorldModel, WorldModelTrack, TrackHistoryPoint
 
