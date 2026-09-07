@@ -103,31 +103,48 @@ class TrajectoryCostEvaluator:
                 min_boundary_margin_m=0.0
             )
 
-        # 2. Road Traversability & Corridor Boundaries
+        # 2. Road Traversability & Hard Corridor Boundary Invariant
         cost_traversability = 0.0
         min_boundary_margin = 999.0
+        vehicle_half_width = 0.90
+        safety_buffer = 0.15 # Minimum required clearance to ditch/verge
 
-        corridor_half_w = max(2.5, perception.drivable_corridor.average_width_m * 0.5)
+        corridor_pts = perception.drivable_corridor.boundary_points
+        fallback_half_w = max(2.1, perception.drivable_corridor.average_width_m * 0.5)
 
         for pt in candidate.waypoints:
-            dist_to_left = corridor_half_w - pt.y
-            dist_to_right = pt.y - (-corridor_half_w)
-            margin = min(dist_to_left, dist_to_right)
+            # Find closest corridor boundary station
+            d_left = fallback_half_w
+            d_right = -fallback_half_w
+
+            if corridor_pts:
+                # Approximate matching by waypoint index or relative distance
+                closest_bp = min(corridor_pts, key=lambda bp: abs(bp.s - (pt.x - candidate.waypoints[0].x)))
+                d_left = closest_bp.d_left
+                d_right = closest_bp.d_right
+
+            # Physical clearance from vehicle outer envelope to left and right road edges
+            margin_left = d_left - (pt.y + vehicle_half_width)
+            margin_right = (pt.y - vehicle_half_width) - d_right
+            margin = min(margin_left, margin_right)
+
             if margin < min_boundary_margin:
                 min_boundary_margin = margin
 
-            if margin < 0.30:
-                cost_traversability += (0.30 - margin) ** 2 * 100.0
+            # Soft cost near boundary
+            if margin < 0.45:
+                cost_traversability += ((0.45 - margin) ** 2) * self.w_traversability
 
-        if min_boundary_margin < 0.0:
-            default_breakdown["traversability"] = 88888.0
+        # Hard Safety Invariant: Candidate trajectory must remain strictly inside drivable road
+        if min_boundary_margin < safety_buffer:
+            default_breakdown["traversability"] = 99999.0
             return TrajectoryCostScore(
                 candidate_id=candidate.candidate_id,
-                total_cost=88888.0,
+                total_cost=99999.0,
                 is_feasible=False,
                 cost_breakdown=default_breakdown,
                 min_clearance_m=0.0,
-                min_boundary_margin_m=min_boundary_margin
+                min_boundary_margin_m=round(min_boundary_margin, 3)
             )
 
         # 3. Dynamic Safety & Collision Risk against Multi-Modal Predictions

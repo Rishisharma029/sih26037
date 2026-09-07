@@ -46,13 +46,27 @@ class ControlBarrierFilter:
                     wp.acceleration_mps2 = -3.5
 
             # 2. Corridor boundary barrier condition: h_boundary >= 0
-            dist_left = corridor_half_w - wp.y
-            dist_right = wp.y - (-corridor_half_w)
+            d_left = corridor_half_w
+            d_right = -corridor_half_w
+            if perception.drivable_corridor.boundary_points:
+                closest_bp = min(perception.drivable_corridor.boundary_points, key=lambda bp: abs(bp.s - wp.x))
+                d_left = closest_bp.d_left
+                d_right = closest_bp.d_right
+
+            veh_half_w = 0.90
+            dist_left = d_left - (wp.y + veh_half_w)
+            dist_right = (wp.y - veh_half_w) - d_right
             b_margin = min(dist_left, dist_right)
             if b_margin < min_margin:
                 min_margin = b_margin
 
-            if b_margin < 0.20:
+            if b_margin < 0.0:
+                # Critical road edge breach: halt immediately
+                barrier_violated = True
+                wp.speed_mps = 0.0
+                wp.acceleration_mps2 = -6.0
+            elif b_margin < 0.25:
+                # Approaching road verge: decelerate to safe crawl
                 barrier_violated = True
                 wp.speed_mps = min(wp.speed_mps, 2.0)
                 wp.acceleration_mps2 = -2.5

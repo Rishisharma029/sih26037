@@ -56,6 +56,74 @@ class VillageRoadGeometry:
         d_right = -(base_half_w + right_noise)
         return d_left, d_right
 
+    def frenet_to_cartesian(self, s: float, d: float) -> Tuple[float, float, float]:
+        """Converts Frenet coordinates (s, d) to global Cartesian (x, y, yaw_rad).
+        +d is to the left of the centerline, -d is to the right.
+        """
+        cx, cy, cyaw = self.get_centerline_point(s)
+        x = cx - d * math.sin(cyaw)
+        y = cy + d * math.cos(cyaw)
+        return x, y, cyaw
+
+    def cartesian_to_frenet(self, x: float, y: float, s_guess: Optional[float] = None) -> Tuple[float, float]:
+        """Projects global Cartesian (x, y) onto road centerline to compute Frenet (s, d).
+        
+        Returns:
+            (s, d):
+                s: Arc-length station along centerline (meters)
+                d: Lateral offset from centerline (meters, positive left, negative right)
+        """
+        if x <= 100.0 and s_guess is None:
+            return x, y
+
+        # Robust local search around guess or station sweep
+        search_start = max(0.0, s_guess - 20.0) if s_guess is not None else max(0.0, x - 30.0)
+        search_end = min(self.length_m, search_start + 60.0)
+        
+        best_s = search_start
+        min_dist_sq = float("inf")
+        
+        # Coarse step
+        s = search_start
+        while s <= search_end:
+            cx, cy, _ = self.get_centerline_point(s)
+            dist_sq = (x - cx) ** 2 + (y - cy) ** 2
+            if dist_sq < min_dist_sq:
+                min_dist_sq = dist_sq
+                best_s = s
+            s += 1.0
+
+        # Fine refinement around best_s
+        s_fine_start = max(0.0, best_s - 1.5)
+        s_fine_end = min(self.length_m, best_s + 1.5)
+        s = s_fine_start
+        while s <= s_fine_end:
+            cx, cy, _ = self.get_centerline_point(s)
+            dist_sq = (x - cx) ** 2 + (y - cy) ** 2
+            if dist_sq < min_dist_sq:
+                min_dist_sq = dist_sq
+                best_s = s
+            s += 0.05
+
+        cx, cy, cyaw = self.get_centerline_point(best_s)
+        dx = x - cx
+        dy = y - cy
+        # Lateral offset: d = -dx * sin(cyaw) + dy * cos(cyaw)
+        d = -dx * math.sin(cyaw) + dy * math.cos(cyaw)
+        return best_s, d
+
+    def get_ditch_margin(self, s: float, d: float, vehicle_half_width: float = 0.90) -> float:
+        """Computes true physical clearance margin (meters) between the vehicle boundary
+        and the left/right irregular road edges/ditches.
+        
+        A value >= 0 means the vehicle is completely on the drivable road surface.
+        A value < 0 means the vehicle envelope has breached the road edge.
+        """
+        d_left, d_right = self.get_corridor_widths(s)
+        margin_left = d_left - (d + vehicle_half_width)
+        margin_right = (d - vehicle_half_width) - d_right
+        return min(margin_left, margin_right)
+
 
 # Aliases
 RoadGeometry = VillageRoadGeometry

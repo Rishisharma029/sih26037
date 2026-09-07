@@ -38,9 +38,11 @@ class SimulationEngineState:
         self.lon_ctrl = LongitudinalPIDController(kp=22.0, ki=0.5, kd=2.0)
         self.supervisory = EmergencyBrakeSupervisory(aeb_ttc_threshold_s=0.85)
         self.predictor = TrajectoryPredictor(horizon_seconds=3.0, dt=0.5, mode="ensemble")
+        self.boundary_detector = FreeSpaceBoundaryDetector(default_width_m=4.3)
         self.is_running = True
         self.target_speed_mps = 6.0
         self.is_emergency_stop = False
+        self.is_completed = False
         self.step_count = 0
         self.min_corridor_margin = 2.0
         self.latest_telemetry: Dict[str, Any] = {}
@@ -48,6 +50,7 @@ class SimulationEngineState:
     def reset(self):
         self.scenario = UnmarkedVillageRoadScenario()
         self.is_emergency_stop = False
+        self.is_completed = False
         self.step_count = 0
         self.min_corridor_margin = 2.0
 
@@ -57,9 +60,17 @@ class SimulationEngineState:
 
         dt = self.scenario.dt
         ego_state = self.scenario.simulator.state
-        s_curr = ego_state.pose.position.x
+        s_curr, d_curr = self.scenario.env.geometry.cartesian_to_frenet(
+            ego_state.pose.position.x,
+            ego_state.pose.position.y
+        )
 
-        # 1. Sample road geometry ahead to build candidate trajectory
+        # Check for destination arrival
+        if s_curr >= self.scenario.env.geometry.length_m - 6.0:
+            self.is_completed = True
+            self.target_speed_mps = 0.0
+
+        # 1. Sample road geometry ahead to build candidate trajectory along true spline arc-length
         waypoints = []
         for i in range(1, 12):
             s_ahead = s_curr + i * 2.2
@@ -103,12 +114,19 @@ class SimulationEngineState:
         state, raw_sensor = self.scenario.run_step(cmd)
         self.step_count += 1
 
-        # 4. Corridor bounds & metrics
-        d_left, d_right = self.scenario.env.geometry.get_corridor_widths(state.pose.position.x)
-        margin_left = d_left - state.pose.position.y
-        margin_right = state.pose.position.y - d_right
-        margin = min(margin_left, margin_right)
+        # 4. Accurate Frenet Corridor bounds & true ditch margins
+        s_post, d_post = self.scenario.env.geometry.cartesian_to_frenet(
+            state.pose.position.x,
+            state.pose.position.y,
+            s_guess=s_curr
+        )
+        d_left, d_right = self.scenario.env.geometry.get_corridor_widths(s_post)
+        margin = self.scenario.env.geometry.get_ditch_margin(s_post, d_post, vehicle_half_width=0.90)
         self.min_corridor_margin = min(self.min_corridor_margin, margin)
+
+        # Hard safety invariant: Emergency halt if vehicle breaches ditch verge
+        if margin < 0.0:
+            self.is_emergency_stop = True
 
         # 5. Transform all Actors to standard Ego Vehicle Coordinates
         actors_data = []
@@ -152,16 +170,19 @@ class SimulationEngineState:
                 "is_static": a.is_static
             })
 
-        # Run Phase 5 Motion Prediction
+        # Run Phase 5 Motion Prediction with rich FreeSpaceCorridor
+        corridor = self.boundary_detector.detect_corridor(
+            timestamp=state.timestamp,
+            lookahead_m=40.0,
+            step_m=4.0,
+            current_s=s_post,
+            geometry=self.scenario.env.geometry
+        )
         perception_frame = PerceptionOutput(
             timestamp=state.timestamp,
             frame_id=self.step_count,
             obstacles=obstacles,
-            drivable_corridor=FreeSpaceCorridor(
-                timestamp=state.timestamp,
-                boundary_points=[],
-                average_width_m=float(d_left - d_right)
-            )
+            drivable_corridor=corridor
         )
         pred_out = self.predictor.predict(perception_frame, ego_speed=state.twist.speed_mps)
 
