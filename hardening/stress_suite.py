@@ -144,7 +144,7 @@ To guarantee safety in unstructured Indian operating environments, the SIH26037 
 
 | # | Adversarial Fault Scenario | Injected Condition | Safety Fallback Policy | Result | Status |
 |---|---|---|---|:---:|:---:|
-| 1 | **Sensor Noise** | Gaussian spatial jitter ($\sigma=0.3$m, $\sigma_v=0.5$m/s) | EKF Sensor Fusion covariance weighting | 0 Collisions | **PASS** |
+| 1 | **Sensor Noise** | Gaussian spatial jitter ($\\sigma=0.3$m, $\\sigma_v=0.5$m/s) | EKF Sensor Fusion covariance weighting | 0 Collisions | **PASS** |
 | 2 | **Detection Dropout** | Missed obstacle bounding boxes (40% dropout) | Track persistence & dynamic memory | 0 Collisions | **PASS** |
 | 3 | **Dynamic Occlusion** | Hidden actors behind heavy trucks/buses | Spatial risk envelope inflation | 0 Collisions | **PASS** |
 | 4 | **Sudden Incursion** | High-speed actor cut-in within 3.8m | Autonomous Emergency Braking (AEB) | 0 Collisions | **PASS** |
