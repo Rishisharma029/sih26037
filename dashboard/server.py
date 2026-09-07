@@ -22,21 +22,23 @@ from interfaces import (
     VehicleTelemetry, Pose3D, Twist3D, BehaviorMode,
     SafetyAction, ControlCommand, SafeTrajectory, TrajectoryPoint,
     Point3D, Vector3D, GearMode, PerceptionOutput, FreeSpaceCorridor,
-    TrackedObstacle, BoundingBox3D
+    TrackedObstacle, BoundingBox3D, PlannedTrajectory
 )
 from scenarios.scenario_unmarked_village import UnmarkedVillageRoadScenario
 from vehicle_control.lateral_controller import StanleyLateralController
 from vehicle_control.longitudinal_controller import LongitudinalPIDController
-from collision_avoidance.emergency_brake import EmergencyBrakeSupervisory
+from collision_avoidance.safety_supervisor import SafetySupervisoryLayer
 from perception.boundary_detector import FreeSpaceBoundaryDetector
 from prediction.trajectory_predictor import TrajectoryPredictor
+from planning.baseline_planner import BaselinePlanner
 
 class SimulationEngineState:
     def __init__(self):
         self.scenario = UnmarkedVillageRoadScenario()
         self.lat_ctrl = StanleyLateralController(k_gain=1.4)
         self.lon_ctrl = LongitudinalPIDController(kp=22.0, ki=0.5, kd=2.0)
-        self.supervisory = EmergencyBrakeSupervisory(aeb_ttc_threshold_s=0.85)
+        self.supervisory = SafetySupervisoryLayer(aeb_ttc_threshold_s=1.0, replan_ttc_threshold_s=2.0, slowdown_ttc_threshold_s=4.0)
+        self.planner = BaselinePlanner(horizon_seconds=3.0, dt=0.2)
         self.predictor = TrajectoryPredictor(horizon_seconds=3.0, dt=0.5, mode="ensemble")
         self.boundary_detector = FreeSpaceBoundaryDetector(default_width_m=4.3)
         self.is_running = True
@@ -70,65 +72,7 @@ class SimulationEngineState:
             self.is_completed = True
             self.target_speed_mps = 0.0
 
-        # 1. Sample road geometry ahead to build candidate trajectory along true spline arc-length
-        waypoints = []
-        for i in range(1, 12):
-            s_ahead = s_curr + i * 2.2
-            rx, ry, ryaw = self.scenario.env.geometry.get_centerline_point(s_ahead)
-            waypoints.append(TrajectoryPoint(
-                timestamp=ego_state.timestamp + i * 0.15,
-                x=rx,
-                y=ry,
-                yaw_rad=ryaw,
-                speed_mps=0.0 if self.is_emergency_stop else self.target_speed_mps
-            ))
-
-        safe_traj = SafeTrajectory(
-            timestamp=ego_state.timestamp,
-            source_trajectory_id="village_live_traj",
-            waypoints=waypoints,
-            safety_action=SafetyAction.EMERGENCY_BRAKE if self.is_emergency_stop else SafetyAction.NONE,
-            is_emergency_stop=self.is_emergency_stop,
-            barrier_margin_m=2.5,
-            min_ttc_seconds=999.0
-        )
-
-        # 2. Control computation
-        steer = self.lat_ctrl.compute_steering(ego_state, safe_traj)
-        throttle, brake = self.lon_ctrl.compute_throttle_brake(ego_state, safe_traj, dt=dt)
-
-        if self.is_emergency_stop:
-            throttle = 0.0
-            brake = 100.0
-
-        cmd = ControlCommand(
-            timestamp=ego_state.timestamp,
-            steering_angle_rad=steer,
-            throttle_pct=throttle,
-            brake_pct=brake,
-            gear=GearMode.DRIVE,
-            emergency_brake_active=self.is_emergency_stop
-        )
-
-        # 3. Physics step
-        state, raw_sensor = self.scenario.run_step(cmd)
-        self.step_count += 1
-
-        # 4. Accurate Frenet Corridor bounds & true ditch margins
-        s_post, d_post = self.scenario.env.geometry.cartesian_to_frenet(
-            state.pose.position.x,
-            state.pose.position.y,
-            s_guess=s_curr
-        )
-        d_left, d_right = self.scenario.env.geometry.get_corridor_widths(s_post)
-        margin = self.scenario.env.geometry.get_ditch_margin(s_post, d_post, vehicle_half_width=0.90)
-        self.min_corridor_margin = min(self.min_corridor_margin, margin)
-
-        # Hard safety invariant: Emergency halt if vehicle breaches ditch verge
-        if margin < 0.0:
-            self.is_emergency_stop = True
-
-        # 5. Transform all Actors to standard Ego Vehicle Coordinates
+        # 1. Transform all Actors to standard Ego Vehicle Coordinates
         actors_data = []
         obstacles = []
         from coordinates import transform_actor_to_ego_tracked_obstacle
@@ -146,14 +90,14 @@ class SimulationEngineState:
                 yaw_world_rad=a.yaw_rad,
                 speed_mps=a.speed_mps,
                 is_static=a.is_static,
-                ego_pose=state.pose,
-                ego_twist=state.twist,
+                ego_pose=ego_state.pose,
+                ego_twist=ego_state.twist,
                 confidence=0.95
             )
             obstacles.append(obs)
 
             # Compute dynamic Time-To-Collision (TTC) in ego body frame
-            ttc_eval = self.supervisory.ttc_calc.compute_ttc(state, [obs])
+            ttc_eval = self.supervisory.ttc_calc.compute_ttc(ego_state, [obs])
             ttc_val = ttc_eval.min_ttc_seconds if ttc_eval.min_ttc_seconds < 100.0 else None
 
             actors_data.append({
@@ -170,21 +114,76 @@ class SimulationEngineState:
                 "is_static": a.is_static
             })
 
-        # Run Phase 5 Motion Prediction with rich FreeSpaceCorridor
+        # 2. Perception & Corridor Detection
         corridor = self.boundary_detector.detect_corridor(
-            timestamp=state.timestamp,
+            timestamp=ego_state.timestamp,
             lookahead_m=40.0,
             step_m=4.0,
-            current_s=s_post,
+            current_s=s_curr,
             geometry=self.scenario.env.geometry
         )
         perception_frame = PerceptionOutput(
-            timestamp=state.timestamp,
+            timestamp=ego_state.timestamp,
             frame_id=self.step_count,
             obstacles=obstacles,
             drivable_corridor=corridor
         )
-        pred_out = self.predictor.predict(perception_frame, ego_speed=state.twist.speed_mps)
+
+        # 3. Motion Prediction
+        pred_out = self.predictor.predict(perception_frame, ego_speed=ego_state.twist.speed_mps)
+
+        # 4. Adaptive Path Planning (Candidate Lateral Offsets)
+        planned_traj = self.planner.plan(
+            ego_state=ego_state,
+            perception=perception_frame,
+            prediction=pred_out,
+            target_cruise_speed_mps=self.target_speed_mps
+        )
+
+        # 5. Independent Collision Avoidance & Safety Supervision
+        safe_traj = self.supervisory.supervise(
+            planned=planned_traj,
+            ego_state=ego_state,
+            perception=perception_frame,
+            prediction=pred_out
+        )
+
+        if safe_traj.is_emergency_stop:
+            self.is_emergency_stop = True
+
+        # 6. Control computation
+        steer = self.lat_ctrl.compute_steering(ego_state, safe_traj)
+        throttle, brake = self.lon_ctrl.compute_throttle_brake(ego_state, safe_traj, dt=dt)
+
+        if self.is_emergency_stop or safe_traj.is_emergency_stop:
+            throttle = 0.0
+            brake = 100.0
+
+        cmd = ControlCommand(
+            timestamp=ego_state.timestamp,
+            steering_angle_rad=steer,
+            throttle_pct=throttle,
+            brake_pct=brake,
+            gear=GearMode.DRIVE,
+            emergency_brake_active=self.is_emergency_stop or safe_traj.is_emergency_stop
+        )
+
+        # 7. Physics step
+        state, raw_sensor = self.scenario.run_step(cmd)
+        self.step_count += 1
+
+        # 8. Accurate Frenet Corridor bounds & true ditch margins
+        s_post, d_post = self.scenario.env.geometry.cartesian_to_frenet(
+            state.pose.position.x,
+            state.pose.position.y,
+            s_guess=s_curr
+        )
+        d_left, d_right = self.scenario.env.geometry.get_corridor_widths(s_post)
+        margin = self.scenario.env.geometry.get_ditch_margin(s_post, d_post, vehicle_half_width=0.90)
+        self.min_corridor_margin = min(self.min_corridor_margin, margin)
+
+        if margin < 0.0:
+            self.is_emergency_stop = True
 
         predictions_data = []
         for agent in pred_out.agents:
@@ -231,6 +230,19 @@ class SimulationEngineState:
                 "corridor_right_m": round(d_right, 2),
                 "current_margin_m": round(margin, 2),
                 "min_margin_m": round(self.min_corridor_margin, 2)
+            },
+            "safety": {
+                "safety_action": safe_traj.safety_action.value,
+                "safety_status_reason": safe_traj.safety_status_reason,
+                "min_ttc_s": round(safe_traj.min_ttc_seconds, 2) if safe_traj.min_ttc_seconds < 100.0 else None,
+                "barrier_margin_m": round(safe_traj.barrier_margin_m, 2),
+                "is_emergency_stop": safe_traj.is_emergency_stop,
+                "replan_recommended": safe_traj.replan_recommended
+            },
+            "planning": {
+                "behavior_mode": planned_traj.behavior_mode.value,
+                "target_speed_kph": round(planned_traj.target_speed_mps * 3.6, 1),
+                "trajectory_id": planned_traj.trajectory_id
             },
             "status": {
                 "is_running": self.is_running,
