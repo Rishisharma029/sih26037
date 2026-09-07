@@ -1,10 +1,12 @@
 """
-SIH26037 Live Telemetry & Simulation Visualizer Server (Port 5002)
-Provides:
-1. Live Interactive HTML5 Canvas Bird's-Eye-View (BEV) visualizer with Candidate Path Bundle rendering.
-2. Real-time Causal Decision HUD showing the entire Sense-Predict-Plan-Safe-Act chain.
-3. Real-time telemetry streaming over WebSockets and REST APIs.
-4. Interactive Hazard Spawner (Oncoming Tractor, Crossing Villager, Parked Auto) and Difficulty selector.
+SIH26037 Autonomous Driving Live BEV Visualizer & Telemetry Server (Port 5002)
+Features:
+1. High-Density Autonomous Driving Debug BEV (Road Corridor, Edges, Dynamic Safety Envelope,
+   Obstacles with Velocity Arrows, Multi-Modal Predictions, 7-Candidate Ego Bundle,
+   Selected Safe Trajectory, Collision Zones, Goal Direction & 30m Lookahead Grid).
+2. Real-time Causal Decision HUD showing Sense -> Predict -> TTC -> Candidate Bundle -> Stanley Actuation.
+3. Dual-View Mode Switcher: Ego-Centric ADAS Cockpit (Forward Up) vs Panoramic World Overview.
+4. Interactive Hazard Injection (Tractor, Pedestrian, Auto) & Difficulty selector.
 """
 import sys
 import os
@@ -32,7 +34,7 @@ from collision_avoidance.safety_supervisor import SafetySupervisoryLayer
 from perception.boundary_detector import FreeSpaceBoundaryDetector
 from prediction.trajectory_predictor import TrajectoryPredictor
 from planning.baseline_planner import BaselinePlanner
-from coordinates import transform_actor_to_ego_tracked_obstacle
+from coordinates import transform_actor_to_ego_tracked_obstacle, world_to_ego_2d
 
 class HazardSpawnRequest(BaseModel):
     hazard_type: str = "tractor" # tractor | pedestrian | auto
@@ -58,6 +60,7 @@ class SimulationEngineState:
         self.step_count = 0
         self.min_corridor_margin = 2.0
         self.latest_telemetry: Dict[str, Any] = {}
+        self.step()
 
     def set_difficulty(self, diff_name: str):
         level_map = {
@@ -75,6 +78,7 @@ class SimulationEngineState:
         self.is_completed = False
         self.step_count = 0
         self.min_corridor_margin = 2.0
+        self.step()
 
     def spawn_hazard(self, hazard_type: str, dist_ahead: float = 35.0):
         if hazard_type == "tractor":
@@ -127,25 +131,39 @@ class SimulationEngineState:
             ttc_eval = self.supervisory.ttc_calc.compute_ttc(ego_state, [obs])
             ttc_val = ttc_eval.min_ttc_seconds if ttc_eval.min_ttc_seconds < 100.0 else None
 
+            # World and ego velocity vectors
+            vx_world = a.speed_mps * math.cos(a.yaw_rad)
+            vy_world = a.speed_mps * math.sin(a.yaw_rad)
+
             actors_data.append({
                 "id": a.id,
                 "class": a.obstacle_class.value,
                 "x_world": round(a.x, 2),
                 "y_world": round(a.y, 2),
+                "z_world": round(a.z, 2),
+                "length_m": round(a.length_m, 2),
+                "width_m": round(a.width_m, 2),
+                "height_m": round(a.height_m, 2),
+                "yaw_world_deg": round(math.degrees(a.yaw_rad), 1),
                 "x_ego": round(obs.bbox.center.x, 2), # Forward distance ahead (+X)
                 "y_ego": round(obs.bbox.center.y, 2), # Lateral distance left (+Y) / right (-Y)
                 "distance_m": round(obs.distance_m, 2), # Euclidean distance (always >= 0)
                 "ttc_s": round(ttc_val, 2) if ttc_val is not None else None,
+                "speed_mps": round(a.speed_mps, 2),
                 "speed_kph": round(a.speed_mps * 3.6, 1),
-                "yaw_deg": round(math.degrees(a.yaw_rad), 1),
-                "is_static": a.is_static
+                "vx_world": round(vx_world, 2),
+                "vy_world": round(vy_world, 2),
+                "vx_ego": round(obs.velocity.x, 2),
+                "vy_ego": round(obs.velocity.y, 2),
+                "is_static": a.is_static,
+                "safety_radius_m": round(max(a.length_m, a.width_m) * 0.6 + 0.5, 2)
             })
 
         # 2. Road Corridor Detection
         corridor = self.boundary_detector.detect_corridor(
             timestamp=ego_state.timestamp,
-            lookahead_m=40.0,
-            step_m=4.0,
+            lookahead_m=45.0,
+            step_m=3.0,
             current_s=s_curr,
             geometry=self.scenario.env.geometry
         )
@@ -212,7 +230,7 @@ class SimulationEngineState:
         if margin < 0.0:
             self.is_emergency_stop = True
 
-        # 9. Format Predictions
+        # 9. Format Multi-Modal Predictions (Forecasted paths with timestamps)
         predictions_data = []
         for agent in pred_out.agents:
             trajs_data = []
@@ -226,7 +244,8 @@ class SimulationEngineState:
                             "x": round(pt.position.x, 2),
                             "y": round(pt.position.y, 2),
                             "sigma_x": round(pt.sigma_x, 2),
-                            "sigma_y": round(pt.sigma_y, 2)
+                            "sigma_y": round(pt.sigma_y, 2),
+                            "time_offset_s": round(pt.timestamp - ego_state.timestamp, 2)
                         }
                         for pt in t.waypoints
                     ]
@@ -239,7 +258,37 @@ class SimulationEngineState:
                 "trajectories": trajs_data
             })
 
-        # 10. Build Live Causal Decision Chain Data
+        # 10. Extract Collision Zones from Candidates
+        collision_zones = []
+        for cand in self.planner.last_candidates_summary:
+            if not cand.get("is_feasible") and cand.get("collision_point"):
+                cp = cand["collision_point"]
+                collision_zones.append({
+                    "x": cp["x"],
+                    "y": cp["y"],
+                    "radius_m": 1.6,
+                    "obstacle_id": cand.get("collision_obstacle_id", "OBSTACLE"),
+                    "offset_m": cand.get("offset", 0.0)
+                })
+
+        # 11. 30m Lookahead Goal Direction & Road Polyline
+        s_goal = min(self.scenario.env.geometry.length_m - 2.0, s_curr + 30.0)
+        gx, gy, goal_yaw = self.scenario.env.geometry.frenet_to_cartesian(s_goal, 0.0)
+
+        road_polyline = []
+        for s_idx in range(max(0, int(s_curr - 20)), min(int(self.scenario.env.geometry.length_m), int(s_curr + 65)), 2):
+            cx, cy, _ = self.scenario.env.geometry.frenet_to_cartesian(float(s_idx), 0.0)
+            dl, dr = self.scenario.env.geometry.get_corridor_widths(float(s_idx))
+            lx, ly, _ = self.scenario.env.geometry.frenet_to_cartesian(float(s_idx), dl)
+            rx, ry, _ = self.scenario.env.geometry.frenet_to_cartesian(float(s_idx), -dr)
+            road_polyline.append({
+                "s": float(s_idx),
+                "cx": round(cx, 2), "cy": round(cy, 2),
+                "lx": round(lx, 2), "ly": round(ly, 2),
+                "rx": round(rx, 2), "ry": round(ry, 2)
+            })
+
+        # 12. Build Live Causal Decision Chain Data
         lead_threat = None
         for a in actors_data:
             if a["x_ego"] > 0 and (a["ttc_s"] is not None or a["distance_m"] < 35.0):
@@ -280,17 +329,31 @@ class SimulationEngineState:
                 "x": round(state.pose.position.x, 2),
                 "y": round(state.pose.position.y, 2),
                 "heading_deg": round(math.degrees(state.pose.heading_rad), 2),
+                "speed_mps": round(state.twist.speed_mps, 2),
                 "speed_kph": round(state.twist.speed_mps * 3.6, 1),
                 "steer_deg": round(math.degrees(state.steer_angle_rad), 1),
                 "throttle_pct": round(cmd.throttle_pct, 1),
                 "brake_pct": round(cmd.brake_pct, 1),
-                "battery_soc": round(state.battery_soc_pct, 1)
+                "battery_soc": round(state.battery_soc_pct, 1),
+                "length_m": 4.5,
+                "width_m": 1.8,
+                "safety_buffer_lat_m": 0.6,
+                "safety_buffer_lon_m": 1.2
+            },
+            "goal": {
+                "x": round(gx, 2),
+                "y": round(gy, 2),
+                "s": round(s_goal, 1),
+                "heading_deg": round(math.degrees(goal_yaw), 1),
+                "distance_ahead_m": round(s_goal - s_curr, 1)
             },
             "road": {
+                "s_curr": round(s_curr, 2),
                 "corridor_left_m": round(d_left, 2),
                 "corridor_right_m": round(d_right, 2),
                 "current_margin_m": round(margin, 2),
-                "min_margin_m": round(self.min_corridor_margin, 2)
+                "min_margin_m": round(self.min_corridor_margin, 2),
+                "polyline": road_polyline
             },
             "safety": {
                 "safety_action": safe_traj.safety_action.value,
@@ -306,6 +369,7 @@ class SimulationEngineState:
                 "trajectory_id": planned_traj.trajectory_id
             },
             "candidates": self.planner.last_candidates_summary,
+            "collision_zones": collision_zones,
             "causal_event": causal_event,
             "status": {
                 "is_running": self.is_running,
@@ -388,30 +452,31 @@ def create_app() -> FastAPI:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SIH26037 — Reactive Collision Avoidance & Causal Decision Chain</title>
+    <title>SIH26037 — Autonomous Driving Debug BEV & Causal Chain Visualizer</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background-color: #0b0f19; color: #e2e8f0; font-family: ui-sans-serif, system-ui, sans-serif; }
-        canvas { background-color: #111827; border-radius: 0.75rem; border: 1px solid #1e293b; }
-        .glass-card { background: rgba(17, 24, 39, 0.85); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 0.75rem; }
-        .chain-step { transition: all 0.2s ease-in-out; }
+        body { background-color: #070b13; color: #e2e8f0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        canvas { background-color: #0a0f1d; border-radius: 0.75rem; border: 1px solid #1e293b; box-shadow: inset 0 0 30px rgba(0,0,0,0.7); }
+        .glass-card { background: rgba(13, 20, 36, 0.88); backdrop-filter: blur(14px); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 0.75rem; }
+        .chain-step { transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); }
+        .badge-glow { box-shadow: 0 0 12px rgba(6, 182, 212, 0.35); }
     </style>
 </head>
-<body class="p-4 md:p-6 max-w-7xl mx-auto space-y-5">
+<body class="p-3 md:p-6 max-w-[1550px] mx-auto space-y-4">
 
     <!-- Header & Interactive Controls -->
-    <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 glass-card p-5">
+    <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 glass-card p-4 md:p-5">
         <div>
-            <div class="inline-flex items-center gap-2 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 mb-1.5">
+            <div class="inline-flex items-center gap-2 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 mb-1">
                 <span class="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></span>
-                SIH26037 • VISIBLY REACTIVE AUTONOMOUS VEHICLE
+                SIH26037 • AUTONOMOUS DRIVING DEBUG VIEW (BEV)
             </div>
             <h1 class="text-xl md:text-2xl font-black tracking-tight text-white flex items-center gap-3">
-                Unmarked Village Road — Reactive Hazard Avoidance
-                <span id="badge-difficulty" class="text-xs px-2.5 py-1 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono font-bold">HARD TIER</span>
+                Adaptive Path Planning & Collision Avoidance
+                <span id="badge-difficulty" class="text-xs px-2.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono font-bold">HARD TIER</span>
             </h1>
             <p class="text-xs text-slate-400 mt-0.5">
-                Causal Pipeline: Hazard Detection → Trajectory Prediction → TTC Invalidation → Candidate Bundle Evaluation → Stanley Steering Deflection.
+                Full Debug Pipeline: Road Corridor • Boundary Margins • Obstacle Bounding Boxes & Velocity Vectors • Multi-Modal Predictions • 7 Candidate Trajectories • Selected Safe Path • Safety Envelope • Collision Zones • Goal Vector.
             </p>
         </div>
 
@@ -423,6 +488,11 @@ def create_app() -> FastAPI:
                 <option value="HARD" selected>Hard (Oncoming Tractor & Pedestrian)</option>
                 <option value="EXTREME">Extreme (Wide Tractor & Darting Ped)</option>
             </select>
+
+            <!-- View Switcher -->
+            <button onclick="toggleViewMode()" id="btn-view-mode" class="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-cyan-300 text-xs font-bold transition border border-cyan-500/30">
+                🔭 View: Ego-Centric ADAS (30m Ahead)
+            </button>
 
             <button onclick="toggleSim()" id="btn-toggle" class="px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow">
                 Pause
@@ -437,40 +507,40 @@ def create_app() -> FastAPI:
     </div>
 
     <!-- Live Causal Decision HUD Banner -->
-    <div id="causal-banner" class="glass-card p-4 border border-cyan-500/30 bg-gradient-to-r from-slate-900 via-cyan-950/40 to-slate-900 space-y-3">
+    <div id="causal-banner" class="glass-card p-3.5 border border-cyan-500/30 bg-gradient-to-r from-slate-950 via-cyan-950/30 to-slate-950 space-y-2.5">
         <div class="flex items-center justify-between">
             <span class="text-xs font-bold uppercase tracking-wider text-cyan-400 flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
-                End-to-End Causal Chain Engine
+                Real-Time Sense-Predict-Plan Causal Arbiter
             </span>
-            <span id="causal-summary-badge" class="text-xs font-mono font-bold px-2.5 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-500/40">
+            <span id="causal-summary-badge" class="text-xs font-mono font-bold px-3 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-500/40">
                 CRUISING NOMINAL PATH
             </span>
         </div>
 
         <!-- 5-Stage Causal Flow Stepper -->
-        <div class="grid grid-cols-2 md:grid-cols-5 gap-2.5 text-xs font-mono">
-            <div id="step-1" class="chain-step p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs font-mono">
+            <div id="step-1" class="chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800">
                 <span class="text-[10px] text-slate-500 font-sans block uppercase">1. Hazard Incursion</span>
                 <span id="hud-hazard" class="font-bold text-slate-300 block truncate">None Detected</span>
                 <span id="hud-hazard-dist" class="text-[10px] text-slate-500">Range: --</span>
             </div>
-            <div id="step-2" class="chain-step p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
-                <span class="text-[10px] text-slate-500 font-sans block uppercase">2. TTC & Intent</span>
+            <div id="step-2" class="chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800">
+                <span class="text-[10px] text-slate-500 font-sans block uppercase">2. Intent & TTC</span>
                 <span id="hud-ttc" class="font-bold text-slate-300 block">TTC > 4.0s (Safe)</span>
                 <span id="hud-risk" class="text-[10px] text-slate-500">Nominal: VALID</span>
             </div>
-            <div id="step-3" class="chain-step p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
+            <div id="step-3" class="chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800">
                 <span class="text-[10px] text-slate-500 font-sans block uppercase">3. Candidate Bundle</span>
                 <span id="hud-candidates" class="font-bold text-slate-300 block">7 Evaluated</span>
                 <span id="hud-cand-status" class="text-[10px] text-emerald-400">Center (0.0m) Clear</span>
             </div>
-            <div id="step-4" class="chain-step p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
+            <div id="step-4" class="chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800">
                 <span class="text-[10px] text-slate-500 font-sans block uppercase">4. Safe Selection</span>
                 <span id="hud-mode" class="font-bold text-cyan-400 block">CRUISE</span>
                 <span id="hud-offset" class="text-[10px] text-slate-400">Offset: 0.0m</span>
             </div>
-            <div id="step-5" class="chain-step p-2.5 rounded-lg bg-slate-900/90 border border-slate-800">
+            <div id="step-5" class="chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800">
                 <span class="text-[10px] text-slate-500 font-sans block uppercase">5. DBW Actuation</span>
                 <span id="hud-steer-act" class="font-bold text-amber-400 block">Steer: 0.0°</span>
                 <span id="hud-speed-act" class="text-[10px] text-slate-400">Speed: 21.6 km/h</span>
@@ -478,49 +548,23 @@ def create_app() -> FastAPI:
         </div>
     </div>
 
-    <!-- Live Telemetry KPI Cards -->
-    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
-        <div class="glass-card p-3.5">
-            <span class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">Speed</span>
-            <span id="kpi-speed" class="text-2xl font-black text-cyan-400 font-mono">0.0</span>
-            <span class="text-[10px] text-slate-500 font-semibold">km/h</span>
-        </div>
-        <div class="glass-card p-3.5">
-            <span class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">Stanley Steer</span>
-            <span id="kpi-steer" class="text-2xl font-black text-amber-400 font-mono">0.0°</span>
-            <span class="text-[10px] text-slate-500 font-semibold">Front Wheel Angle</span>
-        </div>
-        <div class="glass-card p-3.5">
-            <span class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">Distance Traveled</span>
-            <span id="kpi-dist" class="text-2xl font-black text-emerald-400 font-mono">0.0 m</span>
-            <span class="text-[10px] text-slate-500 font-semibold">Station along road</span>
-        </div>
-        <div class="glass-card p-3.5">
-            <span class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">Ditch Margin</span>
-            <span id="kpi-margin" class="text-2xl font-black text-purple-400 font-mono">2.15 m</span>
-            <span class="text-[10px] text-slate-500 font-semibold">Safe Limit >= 0.15m</span>
-        </div>
-        <div class="glass-card p-3.5">
-            <span class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">Safety Action</span>
-            <span id="kpi-safety" class="text-sm font-black text-emerald-400 font-mono block mt-1">NONE</span>
-            <span class="text-[10px] text-slate-500 font-semibold">Supervisory Arbiter</span>
-        </div>
-        <div class="glass-card p-3.5">
-            <span class="text-[10px] text-slate-400 font-bold uppercase tracking-wider block">Behavior Mode</span>
-            <span id="kpi-mode" class="text-sm font-black text-cyan-400 font-mono block mt-1">CRUISE</span>
-            <span class="text-[10px] text-slate-500 font-semibold">Lattice Decision</span>
-        </div>
-    </div>
-
-    <!-- Main BEV Canvas Visualizer -->
-    <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+    <!-- Main BEV Canvas Visualizer & Threat Feed -->
+    <div class="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        <!-- Main Canvas Area -->
         <div class="lg:col-span-3 glass-card p-4 space-y-3">
             <div class="flex flex-wrap items-center justify-between text-xs text-slate-400 px-1 gap-2">
-                <span class="font-bold uppercase tracking-wider flex items-center gap-1.5 text-slate-300">
-                    <span class="w-2 h-2 rounded-full bg-emerald-400"></span> Live BEV Renderer with Candidate Trajectory Bundle
-                </span>
-                <!-- Interactive Hazard Injection Bar -->
                 <div class="flex items-center gap-2">
+                    <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                    <span class="font-bold uppercase tracking-wider text-slate-200">
+                        Autonomous Driving Debug Canvas (BEV)
+                    </span>
+                    <span id="view-mode-tag" class="px-2 py-0.5 rounded text-[10px] font-mono bg-cyan-950 text-cyan-300 border border-cyan-800">
+                        EGO COCKPIT (30M AHEAD)
+                    </span>
+                </div>
+
+                <!-- Interactive Hazard Injection Bar -->
+                <div class="flex items-center gap-1.5">
                     <span class="text-[11px] text-slate-400 font-bold">Inject Hazard:</span>
                     <button onclick="spawnHazard('tractor')" class="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-[11px] font-bold transition">
                         🚜 Oncoming Tractor
@@ -534,49 +578,95 @@ def create_app() -> FastAPI:
                 </div>
             </div>
 
-            <canvas id="simCanvas" width="920" height="440" class="w-full h-auto"></canvas>
+            <!-- Canvas Element -->
+            <div class="relative w-full overflow-hidden rounded-xl">
+                <canvas id="simCanvas" width="1020" height="560" class="w-full h-auto block"></canvas>
+            </div>
 
-            <div class="flex flex-wrap items-center justify-between text-[11px] text-slate-400 pt-1 border-t border-slate-800/80 gap-3">
-                <div class="flex flex-wrap items-center gap-3">
-                    <span class="inline-flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-emerald-400"></span> Selected Safe Path</span>
-                    <span class="inline-flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-rose-500"></span> Blocked Candidate (Collision)</span>
-                    <span class="inline-flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-cyan-500/40"></span> Candidate Alternatives</span>
-                    <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded bg-amber-500"></span> Tractor</span>
-                    <span class="inline-flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded bg-rose-500"></span> Pedestrian</span>
-                </div>
-                <div class="text-slate-500 font-mono">
-                    Candidate Offsets: [-1.5m ... +1.5m]
-                </div>
+            <!-- Visual Legend & Explanation Bar -->
+            <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2 text-[10px] text-slate-300 pt-2 border-t border-slate-800/80">
+                <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-emerald-400 shadow-sm shadow-emerald-400"></span> Selected Trajectory</div>
+                <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-cyan-400/40 border border-cyan-400"></span> Candidate Splines (7)</div>
+                <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-rose-500"></span> Blocked Trajectory</div>
+                <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-rose-500/40 border border-rose-500"></span> Collision Zones</div>
+                <div class="flex items-center gap-1.5"><span class="w-3 h-1 rounded bg-cyan-400/30 border border-cyan-400"></span> Safety Envelope</div>
+                <div class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-amber-400"></span> Velocity Vector (→)</div>
+                <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full border border-yellow-400 text-yellow-400 font-mono text-[9px] flex items-center justify-center">🎯</span> Goal Horizon</div>
             </div>
         </div>
 
-        <!-- Right Side: Detected Objects & Candidate Evaluator Feed -->
+        <!-- Right Side: Threat Radar & Live KPIs -->
         <div class="glass-card p-4 space-y-4">
-            <div class="flex items-center justify-between">
-                <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300">
-                    Live Radar & Threat Feed
-                </h3>
-                <span class="text-[10px] text-cyan-400 font-mono">20 Hz Sense</span>
-            </div>
-            
-            <div id="actors-list" class="space-y-2 text-xs max-h-60 overflow-y-auto pr-1">
-                <!-- Dynamically populated -->
+            <!-- Telemetry Cards -->
+            <div class="grid grid-cols-2 gap-2">
+                <div class="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
+                    <span class="text-[10px] text-slate-400 font-bold uppercase block">Speed</span>
+                    <span id="kpi-speed" class="text-xl font-black text-cyan-400 font-mono">0.0</span>
+                    <span class="text-[9px] text-slate-500 font-semibold">km/h</span>
+                </div>
+                <div class="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
+                    <span class="text-[10px] text-slate-400 font-bold uppercase block">Steer (Stanley)</span>
+                    <span id="kpi-steer" class="text-xl font-black text-amber-400 font-mono">0.0°</span>
+                    <span class="text-[9px] text-slate-500 font-semibold">Front Wheel</span>
+                </div>
+                <div class="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
+                    <span class="text-[10px] text-slate-400 font-bold uppercase block">Ditch Margin</span>
+                    <span id="kpi-margin" class="text-xl font-black text-purple-400 font-mono">2.15 m</span>
+                    <span class="text-[9px] text-slate-500 font-semibold">Hard Invariant</span>
+                </div>
+                <div class="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
+                    <span class="text-[10px] text-slate-400 font-bold uppercase block">Safety Tier</span>
+                    <span id="kpi-safety" class="text-sm font-black text-emerald-400 font-mono block mt-1">NONE</span>
+                    <span class="text-[9px] text-slate-500 font-semibold">Arbiter State</span>
+                </div>
             </div>
 
-            <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300 pt-2 border-t border-slate-800">
-                Lattice Candidates Breakdown
-            </h3>
-            <div id="candidates-list" class="space-y-1 text-[11px] font-mono">
-                <!-- Populated with all 7 offset evaluations -->
+            <!-- Threat Radar Feed -->
+            <div class="space-y-2">
+                <div class="flex items-center justify-between border-t border-slate-800 pt-2">
+                    <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300">
+                        Perception & Velocity Tracking
+                    </h3>
+                    <span class="text-[10px] text-cyan-400 font-mono">20 Hz Track</span>
+                </div>
+                
+                <div id="actors-list" class="space-y-2 text-xs max-h-48 overflow-y-auto pr-1">
+                    <!-- Dynamically populated -->
+                </div>
+            </div>
+
+            <!-- Lattice Candidates Breakdown -->
+            <div class="space-y-1.5">
+                <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300 pt-2 border-t border-slate-800">
+                    7 Candidate Splines Evaluated
+                </h3>
+                <div id="candidates-list" class="space-y-1 text-[11px] font-mono max-h-40 overflow-y-auto pr-1">
+                    <!-- Populated with all 7 offset evaluations -->
+                </div>
             </div>
         </div>
     </div>
 
-    <!-- Script: WebSocket & Canvas Renderer -->
+    <!-- Script: WebSocket & High-Density Canvas Debug Renderer -->
     <script>
         const canvas = document.getElementById('simCanvas');
         const ctx = canvas.getContext('2d');
         let currentData = null;
+        let viewMode = 'ego'; // 'ego' (30m ahead top-down) or 'road' (world horizontal track)
+
+        function toggleViewMode() {
+            viewMode = viewMode === 'ego' ? 'road' : 'ego';
+            const btn = document.getElementById('btn-view-mode');
+            const tag = document.getElementById('view-mode-tag');
+            if (viewMode === 'ego') {
+                btn.innerText = '🔭 View: Ego-Centric ADAS (30m Ahead)';
+                tag.innerText = 'EGO COCKPIT (30M AHEAD)';
+            } else {
+                btn.innerText = '🗺️ View: Panoramic Road Overview';
+                tag.innerText = 'ROAD OVERVIEW (PANORAMA)';
+            }
+            if (currentData) renderScene(currentData);
+        }
 
         const ws = new WebSocket(`ws://${window.location.host}/ws/telemetry`);
         ws.onmessage = (event) => {
@@ -589,10 +679,8 @@ def create_app() -> FastAPI:
             if (!data || !data.ego) return;
             document.getElementById('kpi-speed').innerText = data.ego.speed_kph;
             document.getElementById('kpi-steer').innerText = `${data.ego.steer_deg}°`;
-            document.getElementById('kpi-dist').innerText = `${data.ego.x} m`;
             document.getElementById('kpi-margin').innerText = `${data.road.current_margin_m} m`;
             document.getElementById('kpi-safety').innerText = data.safety.safety_action;
-            document.getElementById('kpi-mode').innerText = data.planning.behavior_mode;
 
             if (data.difficulty) {
                 document.getElementById('badge-difficulty').innerText = `${data.difficulty} TIER`;
@@ -611,30 +699,30 @@ def create_app() -> FastAPI:
             const s5 = document.getElementById('step-5');
 
             if (ce.has_hazard) {
-                s1.className = 'chain-step p-2.5 rounded-lg bg-amber-950/40 border border-amber-500/60 shadow-lg shadow-amber-900/20';
-                document.getElementById('hud-hazard').innerHTML = `<span class="text-amber-400">🚨 ${ce.hazard_id}</span>`;
+                s1.className = 'chain-step p-2 rounded-lg bg-amber-950/40 border border-amber-500/60 shadow-lg shadow-amber-900/20';
+                document.getElementById('hud-hazard').innerHTML = `<span class="text-amber-400 font-bold">🚨 ${ce.hazard_id}</span>`;
                 document.getElementById('hud-hazard-dist').innerText = `Range: ${ce.hazard_dist_m}m`;
 
-                s2.className = 'chain-step p-2.5 rounded-lg bg-rose-950/40 border border-rose-500/60';
+                s2.className = 'chain-step p-2 rounded-lg bg-rose-950/40 border border-rose-500/60';
                 document.getElementById('hud-ttc').innerHTML = `<span class="text-rose-400 font-bold">TTC: ${ce.hazard_ttc_s || '<1.0'}s</span>`;
                 document.getElementById('hud-risk').innerHTML = ce.nominal_path_safe ? '<span class="text-slate-400">Nominal: CLEAR</span>' : '<span class="text-rose-400 font-bold">Nominal: UNSAFE (Blocked)</span>';
 
-                s3.className = 'chain-step p-2.5 rounded-lg bg-cyan-950/40 border border-cyan-500/60';
+                s3.className = 'chain-step p-2 rounded-lg bg-cyan-950/40 border border-cyan-500/60';
                 document.getElementById('hud-candidates').innerText = `7 Candidates Evaluated`;
                 document.getElementById('hud-cand-status').innerHTML = `<span class="text-cyan-300">Offset ${ce.selected_offset_m > 0 ? '+' : ''}${ce.selected_offset_m}m Safe</span>`;
 
-                s4.className = 'chain-step p-2.5 rounded-lg bg-emerald-950/40 border border-emerald-500/60';
+                s4.className = 'chain-step p-2 rounded-lg bg-emerald-950/40 border border-emerald-500/60';
                 document.getElementById('hud-mode').innerText = ce.selected_mode;
                 document.getElementById('hud-offset').innerText = `Chosen: ${ce.selected_offset_m > 0 ? '+' : ''}${ce.selected_offset_m}m`;
 
-                s5.className = 'chain-step p-2.5 rounded-lg bg-indigo-950/40 border border-indigo-500/60';
+                s5.className = 'chain-step p-2 rounded-lg bg-indigo-950/40 border border-indigo-500/60';
                 document.getElementById('hud-steer-act').innerHTML = `<span class="text-amber-300 font-bold">Steer: ${ce.steer_command_deg}°</span>`;
                 document.getElementById('hud-speed-act').innerText = `Speed: ${data.ego.speed_kph} km/h`;
 
-                document.getElementById('causal-summary-badge').className = 'text-xs font-mono font-bold px-2.5 py-0.5 rounded bg-rose-950 text-rose-300 border border-rose-500/60 animate-pulse';
+                document.getElementById('causal-summary-badge').className = 'text-xs font-mono font-bold px-3 py-0.5 rounded bg-rose-950 text-rose-300 border border-rose-500/60 animate-pulse';
                 document.getElementById('causal-summary-badge').innerText = `AVOIDING: ${ce.hazard_id.toUpperCase()} (${ce.selected_mode})`;
             } else {
-                [s1, s2, s3, s4, s5].forEach(el => el.className = 'chain-step p-2.5 rounded-lg bg-slate-900/90 border border-slate-800');
+                [s1, s2, s3, s4, s5].forEach(el => el.className = 'chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800');
                 document.getElementById('hud-hazard').innerText = 'None Detected';
                 document.getElementById('hud-hazard-dist').innerText = 'Range: Clear';
                 document.getElementById('hud-ttc').innerText = 'TTC > 4.0s (Safe)';
@@ -646,11 +734,11 @@ def create_app() -> FastAPI:
                 document.getElementById('hud-steer-act').innerText = `Steer: ${data.ego.steer_deg}°`;
                 document.getElementById('hud-speed-act').innerText = `Speed: ${data.ego.speed_kph} km/h`;
 
-                document.getElementById('causal-summary-badge').className = 'text-xs font-mono font-bold px-2.5 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-500/40';
+                document.getElementById('causal-summary-badge').className = 'text-xs font-mono font-bold px-3 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-500/40';
                 document.getElementById('causal-summary-badge').innerText = 'CRUISING NOMINAL PATH';
             }
 
-            // Update Actors List
+            // Update Actors List with Velocity Vectors
             const listEl = document.getElementById('actors-list');
             listEl.innerHTML = '';
             (data.actors || []).forEach(a => {
@@ -661,15 +749,15 @@ def create_app() -> FastAPI:
                 const ttcBadge = a.ttc_s ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${a.ttc_s < 2.0 ? 'bg-rose-900/80 text-rose-300 animate-pulse' : 'bg-amber-900/40 text-amber-300'}">TTC: ${a.ttc_s}s</span>` : '';
                 item.innerHTML = `
                     <div class="flex items-center justify-between font-semibold">
-                        <span class="text-slate-200">${a.id}</span>
+                        <span class="text-slate-200 font-mono">${a.id}</span>
                         <div class="flex items-center gap-1">
                             ${ttcBadge}
                             <span class="text-[10px] px-1.5 py-0.2 rounded ${a.is_static ? 'bg-slate-800 text-slate-400' : 'bg-cyan-900/50 text-cyan-300'}">${a.class}</span>
                         </div>
                     </div>
-                    <div class="flex justify-between text-[10px] text-slate-400">
-                        <span>Range: <b class="text-slate-200 font-mono">${a.distance_m}m</b> (${aheadText}, ${latText})</span>
-                        <span>Speed: <b class="text-slate-200 font-mono">${a.speed_kph} km/h</b></span>
+                    <div class="flex justify-between text-[10px] text-slate-400 font-mono">
+                        <span>Range: <b class="text-slate-200">${a.distance_m}m</b> (${aheadText}, ${latText})</span>
+                        <span>Vel: <b class="text-amber-300">${a.speed_mps}m/s (${a.speed_kph}kph)</b></span>
                     </div>
                 `;
                 listEl.appendChild(item);
@@ -694,220 +782,523 @@ def create_app() -> FastAPI:
             });
         }
 
+        // ==========================================
+        // HIGH-DENSITY AUTONOMOUS DRIVING BEV RENDERER
+        // ==========================================
         function renderScene(data) {
             if (!data || !data.ego) return;
             const w = canvas.width;
             const h = canvas.height;
             ctx.clearRect(0, 0, w, h);
 
-            // Follow ego vehicle horizontally
-            const egoX = data.ego.x;
-            const egoY = data.ego.y;
-            const scale = 15; // pixels per meter
-            const offsetX = 200 - egoX * scale;
-            const centerY = h / 2;
+            if (viewMode === 'ego') {
+                renderEgoCockpitView(data, w, h);
+            } else {
+                renderRoadOverview(data, w, h);
+            }
+        }
 
-            // 1. Draw Grass/Verge Background
-            ctx.fillStyle = '#111827';
+        // ----------------------------------------------------
+        // VIEW 1: EGO COCKPIT VIEW (Forward Lookahead 30m)
+        // ----------------------------------------------------
+        function renderEgoCockpitView(data, w, h) {
+            const ego = data.ego;
+            const egoX = ego.x;
+            const egoY = ego.y;
+            const egoHeading = ego.heading_deg * Math.PI / 180;
+
+            // Ego origin on canvas (centered horizontally, lower-middle vertically)
+            const originX = w / 2;
+            const originY = h - 90;
+            const scale = 11.5; // pixels per meter (35m forward lookahead)
+
+            // Helper to transform world coordinates (wx, wy) into Canvas Screen Coordinates
+            function worldToScreen(wx, wy) {
+                const dx = wx - egoX;
+                const dy = wy - egoY;
+                // Rotate into ego body frame (+X forward, +Y left)
+                const xEgo = dx * Math.cos(egoHeading) + dy * Math.sin(egoHeading);
+                const yEgo = -dx * Math.sin(egoHeading) + dy * Math.cos(egoHeading);
+                // Canvas mapping: forward (+xEgo) is UP (-Y), left (+yEgo) is LEFT (-X)
+                const sx = originX - yEgo * scale;
+                const sy = originY - xEgo * scale;
+                return { sx, sy, xEgo, yEgo };
+            }
+
+            // 1. Radar Grid & Dark Background
+            ctx.fillStyle = '#0a0f1d';
             ctx.fillRect(0, 0, w, h);
 
-            // 2. Draw Unmarked Road Surface
-            ctx.fillStyle = '#1e293b';
-            ctx.beginPath();
-            for (let x = -20; x < 260; x += 2) {
-                const dL = 2.15 + 0.15 * Math.sin(x * 0.08);
-                const screenX = x * scale + offsetX;
-                const screenY = centerY - dL * scale;
-                if (x === -20) ctx.moveTo(screenX, screenY);
-                else ctx.lineTo(screenX, screenY);
-            }
-            for (let x = 258; x >= -20; x -= 2) {
-                const dR = -(2.15 + 0.18 * Math.cos(x * 0.07));
-                const screenX = x * scale + offsetX;
-                const screenY = centerY - dR * scale;
-                ctx.lineTo(screenX, screenY);
-            }
-            ctx.closePath();
-            ctx.fill();
-
-            // 3. Draw Irregular Shoulder & Ditch Lines
-            ctx.strokeStyle = '#475569';
-            ctx.lineWidth = 1.5;
-            ctx.setLineDash([4, 4]);
-            ctx.stroke();
-            ctx.setLineDash([]);
-
-            // 4. Draw Ego Range Distance Arcs (+10m, +25m, +40m)
-            const egoScreenX = egoX * scale + offsetX;
-            const egoScreenY = centerY - egoY * scale;
-
-            [10, 25, 40].forEach(r => {
-                ctx.strokeStyle = 'rgba(6, 182, 212, 0.20)';
-                ctx.lineWidth = 1;
-                ctx.setLineDash([3, 5]);
+            // Distance Metric Range Arcs (10m, 20m, 30m, 40m)
+            [10, 20, 30, 40].forEach(r => {
+                const arcR = r * scale;
+                ctx.strokeStyle = r === 30 ? 'rgba(234, 179, 8, 0.35)' : 'rgba(6, 182, 212, 0.18)';
+                ctx.lineWidth = r === 30 ? 1.5 : 1.0;
+                ctx.setLineDash([4, 4]);
                 ctx.beginPath();
-                ctx.arc(egoScreenX, egoScreenY, r * scale, -Math.PI / 3, Math.PI / 3);
+                ctx.arc(originX, originY, arcR, -Math.PI * 0.85, -Math.PI * 0.15);
                 ctx.stroke();
-                ctx.fillStyle = 'rgba(6, 182, 212, 0.45)';
-                ctx.font = '9px monospace';
-                ctx.fillText(`+${r}m`, egoScreenX + r * scale + 3, egoScreenY - 4);
+
+                // Range Badge
+                ctx.fillStyle = r === 30 ? '#fde047' : '#06b6d4';
+                ctx.font = 'bold 10px monospace';
+                ctx.fillText(`── ${r} m ──`, originX - 24, originY - arcR - 3);
+            });
+
+            // Lateral offset grid lines (-3m, -2m, -1m, 0, +1m, +2m, +3m)
+            [-3, -2, -1, 0, 1, 2, 3].forEach(lat => {
+                const lineX = originX - lat * scale;
+                ctx.strokeStyle = lat === 0 ? 'rgba(255, 255, 255, 0.15)' : 'rgba(148, 163, 184, 0.08)';
+                ctx.lineWidth = lat === 0 ? 1.5 : 0.8;
+                ctx.setLineDash(lat === 0 ? [5, 5] : [2, 6]);
+                ctx.beginPath();
+                ctx.moveTo(lineX, originY + 30);
+                ctx.lineTo(lineX, originY - 42 * scale);
+                ctx.stroke();
             });
             ctx.setLineDash([]);
 
-            // 5. Draw Candidate Trajectory Bundle (Green = chosen, Red = blocked, Cyan = clear alternatives)
+            // 2. Road Corridor (Drivable polygon & Road Edges with Ditch Berms)
+            const poly = data.road.polyline || [];
+            if (poly.length > 2) {
+                // Shaded asphalt surface
+                ctx.fillStyle = '#161e2e';
+                ctx.beginPath();
+                let started = false;
+                poly.forEach(pt => {
+                    const scr = worldToScreen(pt.lx, pt.ly);
+                    if (!started) { ctx.moveTo(scr.sx, scr.sy); started = true; }
+                    else { ctx.lineTo(scr.sx, scr.sy); }
+                });
+                for (let i = poly.length - 1; i >= 0; i--) {
+                    const scr = worldToScreen(poly[i].rx, poly[i].ry);
+                    ctx.lineTo(scr.sx, scr.sy);
+                }
+                ctx.closePath();
+                ctx.fill();
+
+                // Road Centerline
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
+                ctx.lineWidth = 1.5;
+                ctx.setLineDash([6, 6]);
+                ctx.beginPath();
+                poly.forEach((pt, i) => {
+                    const scr = worldToScreen(pt.cx, pt.cy);
+                    if (i === 0) ctx.moveTo(scr.sx, scr.sy);
+                    else ctx.lineTo(scr.sx, scr.sy);
+                });
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Left Ditch Boundary Edge with Hazard Striping
+                ctx.strokeStyle = '#eab308';
+                ctx.lineWidth = 2.5;
+                ctx.beginPath();
+                poly.forEach((pt, i) => {
+                    const scr = worldToScreen(pt.lx, pt.ly);
+                    if (i === 0) ctx.moveTo(scr.sx, scr.sy);
+                    else ctx.lineTo(scr.sx, scr.sy);
+                });
+                ctx.stroke();
+
+                // Right Ditch Boundary Edge
+                ctx.strokeStyle = '#eab308';
+                ctx.lineWidth = 2.5;
+                ctx.beginPath();
+                poly.forEach((pt, i) => {
+                    const scr = worldToScreen(pt.rx, pt.ry);
+                    if (i === 0) ctx.moveTo(scr.sx, scr.sy);
+                    else ctx.lineTo(scr.sx, scr.sy);
+                });
+                ctx.stroke();
+            }
+
+            // 3. Goal Direction Indicator (30m ahead lookahead horizon)
+            if (data.goal) {
+                const gScr = worldToScreen(data.goal.x, data.goal.y);
+                // Target line from ego to goal
+                ctx.strokeStyle = 'rgba(234, 179, 8, 0.35)';
+                ctx.lineWidth = 1.5;
+                ctx.setLineDash([3, 3]);
+                ctx.beginPath();
+                ctx.moveTo(originX, originY);
+                ctx.lineTo(gScr.sx, gScr.sy);
+                ctx.stroke();
+                ctx.setLineDash([]);
+
+                // Goal Target Crosshair
+                ctx.strokeStyle = '#eab308';
+                ctx.fillStyle = 'rgba(234, 179, 8, 0.25)';
+                ctx.lineWidth = 2.0;
+                ctx.beginPath();
+                ctx.arc(gScr.sx, gScr.sy, 10, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.moveTo(gScr.sx - 14, gScr.sy); ctx.lineTo(gScr.sx + 14, gScr.sy);
+                ctx.moveTo(gScr.sx, gScr.sy - 14); ctx.lineTo(gScr.sx, gScr.sy + 14);
+                ctx.stroke();
+
+                ctx.fillStyle = '#fde047';
+                ctx.font = 'bold 9px monospace';
+                ctx.fillText(`🎯 GOAL: +${data.goal.distance_ahead_m}m`, gScr.sx + 14, gScr.sy + 3);
+            }
+
+            // 4. Candidate Ego Trajectories (7-Spline Bundle)
             (data.candidates || []).forEach(cand => {
                 if (!cand.waypoints || cand.waypoints.length === 0) return;
                 ctx.beginPath();
-                ctx.moveTo(egoScreenX, egoScreenY);
+                ctx.moveTo(originX, originY);
 
-                cand.waypoints.forEach(pt => {
-                    const px = pt.x * scale + offsetX;
-                    const py = centerY - pt.y * scale;
-                    ctx.lineTo(px, py);
+                cand.waypoints.forEach(wp => {
+                    const scr = worldToScreen(wp.x, wp.y);
+                    ctx.lineTo(scr.sx, scr.sy);
                 });
 
                 if (cand.is_selected) {
-                    ctx.strokeStyle = '#10b981'; // Vibrant Green for selected
-                    ctx.lineWidth = 3.5;
+                    ctx.strokeStyle = '#10b981'; // Vibrant glowing green
+                    ctx.lineWidth = 4.0;
                     ctx.shadowColor = '#10b981';
-                    ctx.shadowBlur = 8;
+                    ctx.shadowBlur = 10;
                     ctx.setLineDash([]);
                     ctx.stroke();
                     ctx.shadowBlur = 0;
+
+                    // Waypoint Speed Profile Markers
+                    cand.waypoints.forEach((wp, idx) => {
+                        if (idx % 3 === 0) {
+                            const scr = worldToScreen(wp.x, wp.y);
+                            ctx.fillStyle = '#6ee7b7';
+                            ctx.beginPath();
+                            ctx.arc(scr.sx, scr.sy, 3.5, 0, Math.PI * 2);
+                            ctx.fill();
+                        }
+                    });
                 } else if (cand.is_feasible) {
-                    ctx.strokeStyle = 'rgba(6, 182, 212, 0.35)'; // Cyan for clear alternatives
-                    ctx.lineWidth = 1.5;
-                    ctx.setLineDash([4, 3]);
+                    ctx.strokeStyle = 'rgba(6, 182, 212, 0.40)'; // Cyan for clear alternatives
+                    ctx.lineWidth = 1.8;
+                    ctx.setLineDash([4, 4]);
                     ctx.stroke();
                     ctx.setLineDash([]);
                 } else {
-                    ctx.strokeStyle = 'rgba(239, 68, 68, 0.50)'; // Red for collision/blocked
-                    ctx.lineWidth = 1.5;
-                    ctx.setLineDash([2, 4]);
+                    ctx.strokeStyle = 'rgba(239, 68, 68, 0.55)'; // Dashed red for collision
+                    ctx.lineWidth = 1.8;
+                    ctx.setLineDash([3, 4]);
                     ctx.stroke();
                     ctx.setLineDash([]);
-
-                    // Draw collision X marker at end of blocked path
-                    const lastPt = cand.waypoints[cand.waypoints.length - 1];
-                    if (lastPt) {
-                        const lx = lastPt.x * scale + offsetX;
-                        const ly = centerY - lastPt.y * scale;
-                        ctx.strokeStyle = '#ef4444';
-                        ctx.lineWidth = 2;
-                        ctx.beginPath();
-                        ctx.moveTo(lx - 4, ly - 4); ctx.lineTo(lx + 4, ly + 4);
-                        ctx.moveTo(lx + 4, ly - 4); ctx.lineTo(lx - 4, ly + 4);
-                        ctx.stroke();
-                    }
                 }
             });
 
-            // 6. Draw Multi-Modal Predictions (Forecasted paths of actors)
+            // 5. Collision Zones (Interference Overlaps)
+            (data.collision_zones || []).forEach(cz => {
+                const scr = worldToScreen(cz.x, cz.y);
+                const rPix = cz.radius_m * scale;
+
+                // Pulsating Red Hazard Disk
+                ctx.fillStyle = 'rgba(239, 68, 68, 0.28)';
+                ctx.strokeStyle = '#ef4444';
+                ctx.lineWidth = 2.0;
+                ctx.beginPath();
+                ctx.arc(scr.sx, scr.sy, rPix, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.stroke();
+
+                // ✖ Collision Marker
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 2.5;
+                ctx.beginPath();
+                ctx.moveTo(scr.sx - 6, scr.sy - 6); ctx.lineTo(scr.sx + 6, scr.sy + 6);
+                ctx.moveTo(scr.sx + 6, scr.sy - 6); ctx.lineTo(scr.sx - 6, scr.sy + 6);
+                ctx.stroke();
+
+                ctx.fillStyle = '#fca5a5';
+                ctx.font = 'bold 9px monospace';
+                ctx.fillText(`💥 COLLISION (${cz.obstacle_id})`, scr.sx + rPix + 3, scr.sy + 3);
+            });
+
+            // 6. Multi-Modal Motion Predictions of Obstacles
             (data.predictions || []).forEach(pred => {
                 (pred.trajectories || []).forEach(tr => {
                     if (tr.waypoints && tr.waypoints.length > 0) {
                         ctx.beginPath();
-                        const startPt = tr.waypoints[0];
-                        ctx.moveTo(startPt.x * scale + offsetX, centerY - startPt.y * scale);
+                        const s0 = worldToScreen(tr.waypoints[0].x, tr.waypoints[0].y);
+                        ctx.moveTo(s0.sx, s0.sy);
                         tr.waypoints.forEach(wp => {
-                            ctx.lineTo(wp.x * scale + offsetX, centerY - wp.y * scale);
+                            const scr = worldToScreen(wp.x, wp.y);
+                            ctx.lineTo(scr.sx, scr.sy);
                         });
-                        ctx.strokeStyle = tr.collision_risk > 0.4 ? 'rgba(244, 63, 94, 0.6)' : 'rgba(245, 158, 11, 0.4)';
-                        ctx.lineWidth = 1.5;
+
+                        ctx.strokeStyle = tr.collision_risk > 0.4 ? 'rgba(244, 63, 94, 0.85)' : 'rgba(245, 158, 11, 0.55)';
+                        ctx.lineWidth = tr.collision_risk > 0.4 ? 2.5 : 1.5;
                         ctx.setLineDash([3, 3]);
                         ctx.stroke();
                         ctx.setLineDash([]);
+
+                        // Time Horizon Waypoint Dots (+1.0s, +2.0s, +3.0s)
+                        tr.waypoints.forEach(wp => {
+                            if (Math.abs(wp.time_offset_s - 1.0) < 0.15 || Math.abs(wp.time_offset_s - 2.0) < 0.15 || Math.abs(wp.time_offset_s - 3.0) < 0.15) {
+                                const scr = worldToScreen(wp.x, wp.y);
+                                ctx.fillStyle = tr.collision_risk > 0.4 ? '#f43f5e' : '#fbbf24';
+                                ctx.beginPath();
+                                ctx.arc(scr.sx, scr.sy, 3, 0, Math.PI * 2);
+                                ctx.fill();
+
+                                ctx.font = '8px monospace';
+                                ctx.fillText(`+${wp.time_offset_s}s`, scr.sx + 5, scr.sy + 3);
+                            }
+                        });
                     }
                 });
             });
 
-            // 7. Draw Actors (Tractor, Pedestrian, Auto, Boulder)
+            // 7. Obstacles & Velocity Vectors
             (data.actors || []).forEach(a => {
-                const ax = a.x_world * scale + offsetX;
-                const ay = centerY - a.y_world * scale;
+                const scr = worldToScreen(a.x_world, a.y_world);
+                const relHeading = (a.yaw_world_deg - ego.heading_deg) * Math.PI / 180;
+
+                ctx.save();
+                ctx.translate(scr.sx, scr.sy);
+                ctx.rotate(-relHeading); // Rotate to obstacle relative heading in body frame
+
+                const lengthPix = a.length_m * scale;
+                const widthPix = a.width_m * scale;
 
                 if (a.class === 'TRUCK' || a.id.includes('tractor')) {
-                    // Draw Agricultural Tractor (Amber / Yellow body with large wheels)
+                    // Agricultural Tractor (Amber/Yellow with big wheels)
                     ctx.fillStyle = '#f59e0b';
-                    ctx.fillRect(ax - 26, ay - 14, 52, 28);
-                    ctx.fillStyle = '#1e293b';
-                    ctx.fillRect(ax - 24, ay - 16, 12, 4); // Rear big wheels
-                    ctx.fillRect(ax - 24, ay + 12, 12, 4);
-                    ctx.fillRect(ax + 12, ay - 14, 8, 3); // Front wheels
-                    ctx.fillRect(ax + 12, ay + 11, 8, 3);
+                    ctx.fillRect(-widthPix/2, -lengthPix/2, widthPix, lengthPix);
+                    ctx.fillStyle = '#0f172a';
+                    // Rear Big Wheels
+                    ctx.fillRect(-widthPix/2 - 4, -lengthPix/2 + 2, 4, lengthPix * 0.4);
+                    ctx.fillRect(widthPix/2, -lengthPix/2 + 2, 4, lengthPix * 0.4);
+                    // Front Wheels
+                    ctx.fillRect(-widthPix/2 - 2, lengthPix/2 - lengthPix * 0.35, 3, lengthPix * 0.3);
+                    ctx.fillRect(widthPix/2 - 1, lengthPix/2 - lengthPix * 0.35, 3, lengthPix * 0.3);
+                    // Cab Roof
+                    ctx.fillStyle = '#78350f';
+                    ctx.fillRect(-widthPix/3, -lengthPix/4, widthPix * 0.66, lengthPix * 0.4);
+
                     ctx.fillStyle = '#ffffff';
                     ctx.font = 'bold 9px sans-serif';
-                    ctx.fillText('TRACTOR', ax - 20, ay + 3);
+                    ctx.fillText('🚜 TRACTOR', -widthPix/2 + 2, 2);
                 } else if (a.class === 'PEDESTRIAN' || a.id.includes('pedestrian') || a.id.includes('villager')) {
-                    // Crossing Villager (Rose Dot)
+                    // Pedestrian Circle with Step Direction
                     ctx.fillStyle = '#f43f5e';
                     ctx.beginPath();
-                    ctx.arc(ax, ay, 7, 0, Math.PI * 2);
+                    ctx.arc(0, 0, 7, 0, Math.PI * 2);
                     ctx.fill();
                     ctx.fillStyle = '#ffffff';
                     ctx.font = 'bold 8px sans-serif';
-                    ctx.fillText('PED', ax - 8, ay - 9);
+                    ctx.fillText('🚶 PED', -10, -10);
                 } else if (a.class === 'AUTO_RICKSHAW' || a.id.includes('auto')) {
-                    // Parked Auto-Rickshaw (Orange Box)
+                    // Auto-Rickshaw (3-Wheeler)
                     ctx.fillStyle = '#ea580c';
-                    ctx.fillRect(ax - 16, ay - 9, 32, 18);
+                    ctx.fillRect(-widthPix/2, -lengthPix/2, widthPix, lengthPix);
+                    ctx.fillStyle = '#fde047';
+                    ctx.fillRect(-widthPix/2, -lengthPix/2, widthPix, lengthPix * 0.3); // Yellow canopy front
                     ctx.fillStyle = '#ffffff';
                     ctx.font = 'bold 8px sans-serif';
-                    ctx.fillText('AUTO', ax - 11, ay + 3);
+                    ctx.fillText('🛺 AUTO', -widthPix/2 + 3, 2);
                 } else {
-                    // Roadside Boulder / Debris
+                    // Boulder / Debris
                     ctx.fillStyle = '#64748b';
                     ctx.beginPath();
-                    ctx.arc(ax, ay, 9, 0, Math.PI * 2);
+                    ctx.arc(0, 0, Math.max(6, widthPix/2), 0, Math.PI * 2);
                     ctx.fill();
                 }
 
-                // Range tag
-                ctx.fillStyle = 'rgba(226, 232, 240, 0.9)';
-                ctx.font = '9px monospace';
-                const tag = `${a.x_ego >= 0 ? '+' : ''}${a.x_ego}m`;
-                ctx.fillText(tag, ax - 12, ay - 17);
+                ctx.restore();
+
+                // Velocity Vector Arrow (proportional to speed)
+                if (a.speed_mps > 0.2) {
+                    const vLenPix = a.speed_mps * 3.5 * scale * 0.2; // Arrow length scaled to speed
+                    // Velocity direction in screen coordinates
+                    const vAngle = Math.atan2(a.vy_world, a.vx_world) - egoHeading;
+                    const vEndSx = scr.sx + vLenPix * Math.sin(vAngle);
+                    const vEndSy = scr.sy - vLenPix * Math.cos(vAngle);
+
+                    ctx.strokeStyle = '#fbbf24';
+                    ctx.lineWidth = 2.5;
+                    ctx.beginPath();
+                    ctx.moveTo(scr.sx, scr.sy);
+                    ctx.lineTo(vEndSx, vEndSy);
+                    ctx.stroke();
+
+                    // Arrowhead
+                    ctx.fillStyle = '#fbbf24';
+                    ctx.beginPath();
+                    ctx.arc(vEndSx, vEndSy, 3.5, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Speed Badge
+                    ctx.fillStyle = '#fef08a';
+                    ctx.font = 'bold 9px monospace';
+                    ctx.fillText(`${a.speed_mps}m/s (${a.speed_kph}kph)`, vEndSx + 5, vEndSy - 2);
+                }
+
+                // Range Tag
+                ctx.fillStyle = '#e2e8f0';
+                ctx.font = 'bold 9px monospace';
+                const aheadTxt = a.x_ego >= 0 ? `+${a.x_ego}m` : `${a.x_ego}m`;
+                ctx.fillText(`${a.id} (${aheadTxt})`, scr.sx + 12, scr.sy + 10);
             });
 
-            // 8. Draw Ego Autonomous Vehicle with Steerable Front Wheels
-            ctx.save();
-            ctx.translate(egoScreenX, egoScreenY);
-            ctx.rotate(-data.ego.heading_deg * Math.PI / 180);
+            // 8. Ego Vehicle & Dynamic Safety Envelope
+            // Dynamic Safety Envelope (Expanded footprint bubble around ego)
+            const envLatPix = (ego.width_m/2 + ego.safety_buffer_lat_m) * scale;
+            const envLonPix = (ego.length_m/2 + ego.safety_buffer_lon_m) * scale;
+            const isDanger = data.safety.is_emergency_stop || (data.causal_event && data.causal_event.has_hazard && data.causal_event.hazard_ttc_s && data.causal_event.hazard_ttc_s < 2.0);
+            const isCaution = data.causal_event && data.causal_event.has_hazard;
 
-            // Vehicle Body (Cyan)
+            ctx.strokeStyle = isDanger ? '#ef4444' : (isCaution ? '#f59e0b' : '#06b6d4');
+            ctx.fillStyle = isDanger ? 'rgba(239, 68, 68, 0.15)' : (isCaution ? 'rgba(245, 158, 11, 0.10)' : 'rgba(6, 182, 212, 0.08)');
+            ctx.lineWidth = 1.8;
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath();
+            ctx.roundRect(originX - envLatPix, originY - envLonPix, envLatPix * 2, envLonPix * 2, 8);
+            ctx.fill();
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Ego Body (Facing straight UP in ego cockpit view)
+            const egoLPix = ego.length_m * scale;
+            const egoWPix = ego.width_m * scale;
+
+            // Headlight beams
+            const grad = ctx.createLinearGradient(originX, originY - egoLPix/2, originX, originY - egoLPix/2 - 40);
+            grad.addColorStop(0, 'rgba(254, 240, 138, 0.4)');
+            grad.addColorStop(1, 'rgba(254, 240, 138, 0.0)');
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.moveTo(originX - egoWPix/2 + 2, originY - egoLPix/2);
+            ctx.lineTo(originX - egoWPix/2 - 15, originY - egoLPix/2 - 45);
+            ctx.lineTo(originX + egoWPix/2 + 15, originY - egoLPix/2 - 45);
+            ctx.lineTo(originX + egoWPix/2 - 2, originY - egoLPix/2);
+            ctx.closePath();
+            ctx.fill();
+
+            // Car Body
             ctx.fillStyle = '#06b6d4';
-            ctx.fillRect(-26, -11, 52, 22);
+            ctx.fillRect(originX - egoWPix/2, originY - egoLPix/2, egoWPix, egoLPix);
             ctx.fillStyle = '#0891b2';
-            ctx.fillRect(-12, -9, 24, 18); // Cabin roof
+            ctx.fillRect(originX - egoWPix/3, originY - egoLPix/4, egoWPix * 0.66, egoLPix * 0.5); // Roof
 
-            // Headlights
-            ctx.fillStyle = '#fef08a';
-            ctx.fillRect(25, -9, 3, 5);
-            ctx.fillRect(25, 4, 3, 5);
-
-            // Front Steered Wheels
-            const steerRad = -data.ego.steer_deg * Math.PI / 180;
+            // Front Steered Wheels (Deflected by Stanley controller angle)
+            const steerRad = -ego.steer_deg * Math.PI / 180;
             ctx.fillStyle = '#0f172a';
 
-            // Front Left Wheel
+            // Left Front Wheel
             ctx.save();
-            ctx.translate(18, -12);
+            ctx.translate(originX - egoWPix/2 - 2, originY - egoLPix/3);
             ctx.rotate(steerRad);
-            ctx.fillRect(-5, -2, 10, 4);
+            ctx.fillRect(-2, -5, 4, 10);
             ctx.restore();
 
-            // Front Right Wheel
+            // Right Front Wheel
             ctx.save();
-            ctx.translate(18, 12);
+            ctx.translate(originX + egoWPix/2 + 2, originY - egoLPix/3);
             ctx.rotate(steerRad);
-            ctx.fillRect(-5, -2, 10, 4);
+            ctx.fillRect(-2, -5, 4, 10);
             ctx.restore();
 
-            // Rear Fixed Wheels
-            ctx.fillRect(-20, -14, 10, 4);
-            ctx.fillRect(-20, 10, 10, 4);
+            // Fixed Rear Wheels
+            ctx.fillRect(originX - egoWPix/2 - 3, originY + egoLPix/4, 4, 10);
+            ctx.fillRect(originX + egoWPix/2 - 1, originY + egoLPix/4, 4, 10);
 
-            ctx.restore();
+            // Ego Badge
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 9px sans-serif';
+            ctx.fillText('🚗 EGO AV', originX - 22, originY + 3);
+        }
+
+        // ----------------------------------------------------
+        // VIEW 2: ROAD OVERVIEW (PANORAMIC HORIZONTAL)
+        // ----------------------------------------------------
+        function renderRoadOverview(data, w, h) {
+            const egoX = data.ego.x;
+            const egoY = data.ego.y;
+            const scale = 14;
+            const offsetX = 220 - egoX * scale;
+            const centerY = h / 2;
+
+            ctx.fillStyle = '#0a0f1d';
+            ctx.fillRect(0, 0, w, h);
+
+            // Road surface
+            const poly = data.road.polyline || [];
+            if (poly.length > 2) {
+                ctx.fillStyle = '#1e293b';
+                ctx.beginPath();
+                poly.forEach((pt, i) => {
+                    const sx = pt.cx * scale + offsetX;
+                    const sy = centerY - pt.ly * scale;
+                    if (i === 0) ctx.moveTo(sx, sy);
+                    else ctx.lineTo(sx, sy);
+                });
+                for (let i = poly.length - 1; i >= 0; i--) {
+                    const sx = poly[i].cx * scale + offsetX;
+                    const sy = centerY - poly[i].ry * scale;
+                    ctx.lineTo(sx, sy);
+                }
+                ctx.closePath();
+                ctx.fill();
+
+                // Road Edges
+                ctx.strokeStyle = '#eab308';
+                ctx.lineWidth = 2.0;
+                ctx.stroke();
+            }
+
+            // Candidates
+            (data.candidates || []).forEach(cand => {
+                if (!cand.waypoints || cand.waypoints.length === 0) return;
+                ctx.beginPath();
+                ctx.moveTo(egoX * scale + offsetX, centerY - egoY * scale);
+                cand.waypoints.forEach(wp => {
+                    ctx.lineTo(wp.x * scale + offsetX, centerY - wp.y * scale);
+                });
+
+                if (cand.is_selected) {
+                    ctx.strokeStyle = '#10b981';
+                    ctx.lineWidth = 3.5;
+                    ctx.stroke();
+                } else if (cand.is_feasible) {
+                    ctx.strokeStyle = 'rgba(6, 182, 212, 0.35)';
+                    ctx.lineWidth = 1.5;
+                    ctx.setLineDash([4, 4]);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                } else {
+                    ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
+                    ctx.lineWidth = 1.5;
+                    ctx.setLineDash([2, 4]);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                }
+            });
+
+            // Actors
+            (data.actors || []).forEach(a => {
+                const ax = a.x_world * scale + offsetX;
+                const ay = centerY - a.y_world * scale;
+                ctx.fillStyle = a.class === 'TRUCK' ? '#f59e0b' : (a.class === 'PEDESTRIAN' ? '#f43f5e' : '#ea580c');
+                ctx.beginPath();
+                ctx.arc(ax, ay, 9, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.fillStyle = '#ffffff';
+                ctx.font = 'bold 9px monospace';
+                ctx.fillText(a.id, ax - 12, ay - 12);
+            });
+
+            // Ego
+            const ex = egoX * scale + offsetX;
+            const ey = centerY - egoY * scale;
+            ctx.fillStyle = '#06b6d4';
+            ctx.fillRect(ex - 22, ey - 10, 44, 20);
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 9px sans-serif';
+            ctx.fillText('EGO', ex - 10, ey + 3);
         }
 
         async function toggleSim() {

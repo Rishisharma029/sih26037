@@ -174,7 +174,7 @@ class BaselinePlanner:
                     "rejection_reason": "CLEAR",
                     "waypoints": [{"x": wp.x, "y": wp.y} for wp in waypoints]
                 })
-            else:
+                collision_pt = {"x": round(wx, 3), "y": round(wy, 3)} if is_collision else None
                 raw_candidates_info.append({
                     "offset": offset,
                     "is_feasible": False,
@@ -182,6 +182,8 @@ class BaselinePlanner:
                     "cost": 9999.0,
                     "mode": "COLLISION",
                     "rejection_reason": f"COLLISION ({collision_obs_id})" if collision_obs_id else "INCOMPLETE",
+                    "collision_point": collision_pt,
+                    "collision_obstacle_id": collision_obs_id,
                     "waypoints": [{"x": wp.x, "y": wp.y} for wp in waypoints]
                 })
 
