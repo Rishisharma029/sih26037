@@ -40,6 +40,10 @@ from interfaces import (
     TrackedObstacle, BoundingBox3D, PlannedTrajectory, RoadAnomaly
 )
 from scenarios.scenario_unmarked_village import UnmarkedVillageRoadScenario
+from scenarios.scenario_unsignalled_junction import UnsignalledJunctionScenario
+from scenarios.scenario_highway_cutin import HighwayCutInScenario
+from scenarios.scenario_dense_market import DenseMarketScenario
+from scenarios.scenario_cattle_crossing import CattleCrossingScenario
 from scenarios.difficulty import DifficultyLevel
 from vehicle_control.lateral_controller import StanleyLateralController
 from vehicle_control.longitudinal_controller import LongitudinalPIDController
@@ -62,6 +66,13 @@ class DifficultyRequest(BaseModel):
 
 class PerceptionModeRequest(BaseModel):
     mode: str = "NEURAL_IDD" # NEURAL_IDD | GROUND_TRUTH
+
+
+class ScenarioDirectorRequest(BaseModel):
+    scenario_type: str = "village" # village | junction | highway | market | cattle
+    difficulty: str = "HARD" # EASY | MEDIUM | HARD | EXTREME
+    hazards: List[str] = ["tractor", "pedestrian", "auto", "boulder", "pothole"]
+    auto_start: bool = True
 
 
 class SimulationEngineState:
@@ -137,6 +148,62 @@ class SimulationEngineState:
             self.scenario.spawn_gravel_patch(dist_ahead=max(16.0, dist_ahead * 0.65), y=-0.3, radius_m=1.9)
         elif hazard_type == "speed_bump":
             self.scenario.spawn_speed_bump(dist_ahead=max(20.0, dist_ahead * 0.8), y=0.0, height_m=0.12, radius_m=1.5)
+
+    def direct_scenario(self, scenario_type: str, diff_name: str, hazards: Optional[List[str]] = None, auto_start: bool = True):
+        """Reconfigures and directs an autonomous simulation episode with chosen scenario and hazard package."""
+        level_map = {
+            "EASY": DifficultyLevel.EASY,
+            "MEDIUM": DifficultyLevel.MEDIUM,
+            "HARD": DifficultyLevel.HARD,
+            "EXTREME": DifficultyLevel.EXTREME
+        }
+        self.difficulty = level_map.get(diff_name.upper(), DifficultyLevel.HARD)
+
+        scenario_map = {
+            "village": UnmarkedVillageRoadScenario,
+            "junction": UnsignalledJunctionScenario,
+            "highway": HighwayCutInScenario,
+            "market": DenseMarketScenario,
+            "cattle": CattleCrossingScenario
+        }
+        scenario_cls = scenario_map.get(scenario_type.lower(), UnmarkedVillageRoadScenario)
+        self.scenario = scenario_cls(difficulty=self.difficulty)
+
+        # If custom hazards package is selected, override default actors & anomalies
+        if hazards is not None:
+            self.scenario.env.actors.clear()
+            self.scenario.env.anomalies.clear()
+            for h in hazards:
+                h_clean = h.lower().strip()
+                if h_clean == "tractor":
+                    self.scenario.spawn_oncoming_tractor(dist_ahead=32.0, y=0.75, speed_mps=3.5)
+                elif h_clean == "pedestrian":
+                    self.scenario.spawn_crossing_pedestrian(dist_ahead=20.0, start_y=-2.0, speed_mps=1.4)
+                elif h_clean == "auto":
+                    self.scenario.spawn_parked_auto(dist_ahead=15.0, y=1.5)
+                elif h_clean == "boulder":
+                    self.scenario.spawn_boulder(dist_ahead=26.0, y=-0.9, size_m=1.2)
+                elif h_clean == "pothole":
+                    self.scenario.spawn_pothole(dist_ahead=18.0, y=-0.2, depth_m=-0.18, radius_m=0.85)
+                elif h_clean == "motorcycle":
+                    self.scenario.spawn_oncoming_motorcycle(dist_ahead=30.0, y=1.4, speed_mps=5.2)
+                elif h_clean == "cattle":
+                    self.scenario.spawn_cattle(dist_ahead=24.0, y=-1.1, speed_mps=0.6)
+                elif h_clean == "waterlogged":
+                    self.scenario.spawn_waterlogged_area(dist_ahead=26.0, y=0.2, depth_m=-0.16, radius_m=1.6)
+                elif h_clean == "gravel":
+                    self.scenario.spawn_gravel_patch(dist_ahead=22.0, y=-0.3, radius_m=1.8)
+                elif h_clean == "speed_bump":
+                    self.scenario.spawn_speed_bump(dist_ahead=28.0, y=0.0, height_m=0.12, radius_m=1.5)
+
+        self.is_emergency_stop = False
+        self.is_completed = False
+        self.step_count = 0
+        self.min_corridor_margin = 2.0
+        self.perception_pipeline.tracker.tracks.clear()
+        self.is_running = auto_start
+        self.target_speed_mps = 6.0
+        self.step()
 
     def step(self):
         if not self.is_running:
@@ -699,6 +766,22 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
         sim_engine.set_perception_mode(req.mode)
         return {"status": "PERCEPTION_MODE_UPDATED", "mode": sim_engine.perception_pipeline.mode.value}
 
+    @app.post("/simulation/direct_scenario")
+    async def direct_scenario_api(req: ScenarioDirectorRequest):
+        sim_engine.direct_scenario(
+            scenario_type=req.scenario_type,
+            diff_name=req.difficulty,
+            hazards=req.hazards,
+            auto_start=req.auto_start
+        )
+        return {
+            "status": "SCENARIO_DIRECTED",
+            "scenario": req.scenario_type,
+            "difficulty": sim_engine.difficulty.name,
+            "hazards_count": len(req.hazards),
+            "is_running": sim_engine.is_running
+        }
+
     @app.websocket("/ws/telemetry")
     async def websocket_telemetry(websocket: WebSocket):
         await websocket.accept()
@@ -765,6 +848,11 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                 🔭 View: Ego-Centric ADAS (30m Ahead)
             </button>
 
+            <!-- Scenario Director Launcher -->
+            <button onclick="openDirectorModal()" id="btn-director" class="px-3.5 py-2 rounded-lg bg-gradient-to-r from-amber-600 via-amber-500 to-yellow-500 hover:from-amber-500 hover:to-yellow-400 text-slate-950 text-xs font-black transition shadow-lg flex items-center gap-1.5 ring-1 ring-amber-300 active:scale-95">
+                <span>🎬</span> SCENARIO DIRECTOR
+            </button>
+
             <button onclick="toggleSim()" id="btn-toggle" class="px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition shadow">
                 Pause
             </button>
@@ -774,6 +862,134 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
             <button onclick="triggerEStop()" class="px-3.5 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold transition shadow animate-pulse">
                 E-Stop
             </button>
+        </div>
+    </div>
+
+    <!-- Scenario Director Modal Overlay -->
+    <div id="director-modal" class="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4 hidden">
+        <div class="glass-card bg-slate-950/95 border border-amber-500/40 rounded-2xl max-w-2xl w-full p-6 space-y-5 shadow-2xl relative">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+                <div class="flex items-center gap-3">
+                    <span class="text-3xl">🎬</span>
+                    <div>
+                        <h2 class="text-base md:text-lg font-black text-white tracking-wide flex items-center gap-2">
+                            SCENARIO DIRECTOR & BENCHMARK INJECTOR
+                            <span class="text-[10px] px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono">LIVE DEMO MODE</span>
+                        </h2>
+                        <p class="text-xs text-slate-400">Configure Indian road hazards, select difficulty, or launch 1-click judge presets.</p>
+                    </div>
+                </div>
+                <button onclick="closeDirectorModal()" class="text-slate-400 hover:text-white text-xl font-bold p-1 transition">&times;</button>
+            </div>
+
+            <!-- 1-Click Judge Presets -->
+            <div class="space-y-1.5">
+                <span class="text-xs font-bold text-amber-400 uppercase tracking-wider block">⭐ 1-Click Judge Presets</span>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <button onclick="applyDirectorPreset('tractor_yield')" class="p-2.5 rounded-lg bg-slate-900/90 hover:bg-slate-850 border border-slate-700 hover:border-amber-500/60 text-left transition group">
+                        <span class="text-xs font-bold text-slate-200 block group-hover:text-amber-300">🚜 Tractor Yield & Avoidance</span>
+                        <span class="text-[10px] text-slate-400 block">Village Road • Hard • Center-wandering tractor + auto</span>
+                    </button>
+                    <button onclick="applyDirectorPreset('darting_villager')" class="p-2.5 rounded-lg bg-slate-900/90 hover:bg-slate-850 border border-slate-700 hover:border-amber-500/60 text-left transition group">
+                        <span class="text-xs font-bold text-slate-200 block group-hover:text-amber-300">🚶 Darting Villager & AEB</span>
+                        <span class="text-[10px] text-slate-400 block">Village Road • Hard • Crossing pedestrian + Potholes</span>
+                    </button>
+                    <button onclick="applyDirectorPreset('pothole_traversability')" class="p-2.5 rounded-lg bg-slate-900/90 hover:bg-slate-850 border border-slate-700 hover:border-amber-500/60 text-left transition group">
+                        <span class="text-xs font-bold text-slate-200 block group-hover:text-amber-300">🕳️ Crater Potholes & Floods</span>
+                        <span class="text-[10px] text-slate-400 block">Village Road • Medium • Multi-surface traversability</span>
+                    </button>
+                    <button onclick="applyDirectorPreset('cattle_freeze')" class="p-2.5 rounded-lg bg-slate-900/90 hover:bg-slate-850 border border-slate-700 hover:border-amber-500/60 text-left transition group">
+                        <span class="text-xs font-bold text-slate-200 block group-hover:text-amber-300">🐄 Cattle Freeze & Choke Point</span>
+                        <span class="text-[10px] text-slate-400 block">Cattle Crossing • Extreme • Stray cattle + Boulder</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <!-- Scenario Selector & Difficulty -->
+                <div class="space-y-3">
+                    <div>
+                        <label class="text-xs font-bold text-slate-300 uppercase tracking-wider block mb-1">1. Benchmark Scenario</label>
+                        <select id="director-scenario" class="w-full bg-slate-900 border border-slate-700 text-xs text-white rounded-lg p-2.5 font-bold focus:ring-amber-500 focus:border-amber-500">
+                            <option value="village" selected>▼ Unmarked Village Road (Choke Points & Ditch)</option>
+                            <option value="junction">▼ Unsignalled Junction (Cross Traffic & Cut-Ins)</option>
+                            <option value="highway">▼ Highway Cut-In (High Speed Weaving)</option>
+                            <option value="market">▼ Dense Market Corridor (Heavy Pedestrians & Autos)</option>
+                            <option value="cattle">▼ Cattle Crossing (Unpredictable Wandering Cattle)</option>
+                        </select>
+                    </div>
+
+                    <div>
+                        <label class="text-xs font-bold text-slate-300 uppercase tracking-wider block mb-1">2. Difficulty Tier</label>
+                        <div class="grid grid-cols-4 gap-1.5">
+                            <label class="flex items-center justify-center p-2 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer hover:border-slate-700 text-xs text-slate-300 font-bold">
+                                <input type="radio" name="director-diff" value="EASY" class="mr-1.5 accent-amber-500"> Easy
+                            </label>
+                            <label class="flex items-center justify-center p-2 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer hover:border-slate-700 text-xs text-slate-300 font-bold">
+                                <input type="radio" name="director-diff" value="MEDIUM" class="mr-1.5 accent-amber-500"> Med
+                            </label>
+                            <label class="flex items-center justify-center p-2 rounded-lg bg-slate-900 border border-amber-500/50 cursor-pointer hover:border-amber-500 text-xs text-amber-300 font-bold">
+                                <input type="radio" name="director-diff" value="HARD" checked class="mr-1.5 accent-amber-500"> Hard
+                            </label>
+                            <label class="flex items-center justify-center p-2 rounded-lg bg-slate-900 border border-slate-800 cursor-pointer hover:border-slate-700 text-xs text-slate-300 font-bold">
+                                <input type="radio" name="director-diff" value="EXTREME" class="mr-1.5 accent-amber-500"> Ext
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Hazard Multi-Select Checkboxes -->
+                <div class="space-y-1.5">
+                    <label class="text-xs font-bold text-slate-300 uppercase tracking-wider block">3. Hazard Injection Package</label>
+                    <div class="grid grid-cols-2 gap-2 text-xs text-slate-300 bg-slate-900/90 p-3 rounded-lg border border-slate-800 max-h-48 overflow-y-auto">
+                        <label class="flex items-center gap-2 cursor-pointer hover:text-white">
+                            <input type="checkbox" id="hz-tractor" value="tractor" checked class="accent-amber-500">
+                            <span>🚜 Oncoming tractor</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer hover:text-white">
+                            <input type="checkbox" id="hz-pedestrian" value="pedestrian" checked class="accent-amber-500">
+                            <span>🚶 Pedestrian crossing</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer hover:text-white">
+                            <input type="checkbox" id="hz-auto" value="auto" checked class="accent-amber-500">
+                            <span>🛺 Parked auto</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer hover:text-white">
+                            <input type="checkbox" id="hz-boulder" value="boulder" checked class="accent-amber-500">
+                            <span>🪨 Roadside boulder</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer hover:text-white">
+                            <input type="checkbox" id="hz-pothole" value="pothole" checked class="accent-amber-500">
+                            <span>🕳️ Crater pothole</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer hover:text-white">
+                            <input type="checkbox" id="hz-waterlogged" value="waterlogged" class="accent-amber-500">
+                            <span>🌊 Waterlogged pool</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer hover:text-white">
+                            <input type="checkbox" id="hz-motorcycle" value="motorcycle" class="accent-amber-500">
+                            <span>🏍️ Weaving motorcycle</span>
+                        </label>
+                        <label class="flex items-center gap-2 cursor-pointer hover:text-white">
+                            <input type="checkbox" id="hz-cattle" value="cattle" class="accent-amber-500">
+                            <span>🐄 Wandering cattle</span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Action Buttons -->
+            <div class="flex items-center justify-between pt-3 border-t border-slate-800">
+                <span class="text-[11px] text-slate-400">⚡ Auto-starts autonomous driving upon injection</span>
+                <div class="flex items-center gap-2">
+                    <button onclick="closeDirectorModal()" class="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition">
+                        Cancel
+                    </button>
+                    <button onclick="launchDirectorScenario()" class="px-6 py-2.5 rounded-lg bg-gradient-to-r from-emerald-600 via-teal-600 to-cyan-600 hover:from-emerald-500 hover:to-cyan-500 text-white text-xs font-black uppercase tracking-wider transition shadow-xl flex items-center gap-2 active:scale-95">
+                        <span>🚀</span> START SCENARIO (AUTONOMOUS RUN)
+                    </button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -1026,7 +1242,7 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                     </span>
                 </h2>
                 <p class="text-xs text-slate-400 mt-0.5">
-                    Real-time ranking of candidate splines across lateral Frenet offsets ($P_1 \dots P_7$) against Collision (40%), Clearance (20%), Traversability (15%), Progress (10%), Smoothness (5%), Dynamics (5%), and Uncertainty (5%).
+                    Real-time ranking of candidate splines across lateral Frenet offsets (P1 ... P7) against Collision (40%), Clearance (20%), Traversability (15%), Progress (10%), Smoothness (5%), Dynamics (5%), and Uncertainty (5%).
                 </p>
             </div>
             <div id="decision-summary-box" class="p-2.5 rounded-lg bg-emerald-950/40 border border-emerald-500/40 text-xs font-mono text-emerald-300 max-w-xl">
@@ -1953,6 +2169,90 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ mode: mode })
             });
+        }
+
+        // Scenario Director Modal Handlers
+        function openDirectorModal() {
+            const modal = document.getElementById('director-modal');
+            if (modal) modal.classList.remove('hidden');
+        }
+
+        function closeDirectorModal() {
+            const modal = document.getElementById('director-modal');
+            if (modal) modal.classList.add('hidden');
+        }
+
+        function applyDirectorPreset(preset) {
+            const scSelect = document.getElementById('director-scenario');
+            const hzTractor = document.getElementById('hz-tractor');
+            const hzPed = document.getElementById('hz-pedestrian');
+            const hzAuto = document.getElementById('hz-auto');
+            const hzBoulder = document.getElementById('hz-boulder');
+            const hzPothole = document.getElementById('hz-pothole');
+            const hzWater = document.getElementById('hz-waterlogged');
+            const hzMoto = document.getElementById('hz-motorcycle');
+            const hzCattle = document.getElementById('hz-cattle');
+            
+            // Clear all checkboxes
+            [hzTractor, hzPed, hzAuto, hzBoulder, hzPothole, hzWater, hzMoto, hzCattle].forEach(cb => {
+                if (cb) cb.checked = false;
+            });
+
+            if (preset === 'tractor_yield') {
+                if (scSelect) scSelect.value = 'village';
+                const rad = document.querySelector('input[name="director-diff"][value="HARD"]');
+                if (rad) rad.checked = true;
+                if (hzTractor) hzTractor.checked = true;
+                if (hzAuto) hzAuto.checked = true;
+            } else if (preset === 'darting_villager') {
+                if (scSelect) scSelect.value = 'village';
+                const rad = document.querySelector('input[name="director-diff"][value="HARD"]');
+                if (rad) rad.checked = true;
+                if (hzPed) hzPed.checked = true;
+                if (hzPothole) hzPothole.checked = true;
+            } else if (preset === 'pothole_traversability') {
+                if (scSelect) scSelect.value = 'village';
+                const rad = document.querySelector('input[name="director-diff"][value="MEDIUM"]');
+                if (rad) rad.checked = true;
+                if (hzPothole) hzPothole.checked = true;
+                if (hzWater) hzWater.checked = true;
+                if (hzAuto) hzAuto.checked = true;
+            } else if (preset === 'cattle_freeze') {
+                if (scSelect) scSelect.value = 'cattle';
+                const rad = document.querySelector('input[name="director-diff"][value="EXTREME"]');
+                if (rad) rad.checked = true;
+                if (hzCattle) hzCattle.checked = true;
+                if (hzBoulder) hzBoulder.checked = true;
+            }
+        }
+
+        async function launchDirectorScenario() {
+            const scSelect = document.getElementById('director-scenario');
+            const scenario = scSelect ? scSelect.value : 'village';
+            const diffEl = document.querySelector('input[name="director-diff"]:checked');
+            const diff = diffEl ? diffEl.value : 'HARD';
+            
+            const hazards = [];
+            ['tractor', 'pedestrian', 'auto', 'boulder', 'pothole', 'waterlogged', 'motorcycle', 'cattle'].forEach(h => {
+                const cb = document.getElementById(`hz-${h}`);
+                if (cb && cb.checked) hazards.push(h);
+            });
+
+            await fetch('/simulation/direct_scenario', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    scenario_type: scenario,
+                    difficulty: diff,
+                    hazards: hazards,
+                    auto_start: true
+                })
+            });
+
+            closeDirectorModal();
+            // Sync main diff select
+            const mainDiff = document.getElementById('diff-select');
+            if (mainDiff) mainDiff.value = diff;
         }
     </script>
 </body>
