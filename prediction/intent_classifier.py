@@ -11,9 +11,13 @@ class IntentClassifier:
     """
 
     def classify_intent(self, obstacle: TrackedObstacle) -> MotionIntent:
-        """Classify the primary intent of an obstacle using kinematics and classification."""
+        """Classify the primary intent of an obstacle using temporal history and kinematics."""
         if obstacle.is_static:
             return MotionIntent.STATIONARY
+
+        # 1. Prioritize multi-frame temporal tracker intent if confident
+        if getattr(obstacle, "inferred_intent", None) not in (None, MotionIntent.UNKNOWN):
+            return obstacle.inferred_intent
 
         vx = obstacle.velocity.x
         vy = obstacle.velocity.y

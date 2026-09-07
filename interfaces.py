@@ -142,8 +142,19 @@ class BoundingBox3D(BaseModel):
     yaw_rad: float = Field(0.0, description="Heading orientation in radians")
 
 
+class TrackHistoryFrame(BaseModel):
+    """Snapshot of a tracked obstacle at a previous timestamp."""
+    model_config = ConfigDict(extra="forbid")
+    timestamp: float
+    position: Point3D
+    velocity: Vector3D
+    acceleration: Vector3D = Field(default_factory=lambda: Vector3D(x=0.0, y=0.0, z=0.0))
+    heading_rad: float = Field(0.0)
+    speed_mps: float = Field(0.0)
+
+
 class TrackedObstacle(BaseModel):
-    """Fused object detection with tracking state and dynamic estimates."""
+    """Fused object detection with tracking state, multi-frame history, and dynamic estimates."""
     model_config = ConfigDict(extra="forbid")
     id: str = Field(..., description="Unique persistent tracking ID")
     obstacle_class: ObstacleClass
@@ -153,6 +164,12 @@ class TrackedObstacle(BaseModel):
     acceleration: Vector3D = Field(default_factory=lambda: Vector3D(x=0.0, y=0.0, z=0.0))
     distance_m: float = Field(..., ge=0.0, description="Radial distance to ego vehicle")
     is_static: bool = Field(False, description="True if stationary, False if moving")
+    heading_rad: float = Field(0.0, description="Estimated yaw angle in radians")
+    speed_mps: float = Field(0.0, description="Estimated linear speed in m/s")
+    inferred_intent: Optional[MotionIntent] = Field(default=None, description="Temporal motion intent inferred from history")
+    estimated_risk: float = Field(0.0, ge=0.0, le=1.0, description="Dynamic collision threat score [0, 1]")
+    history: List[TrackHistoryFrame] = Field(default_factory=list, description="Past position, velocity, and acceleration frames")
+    history_length: int = Field(0, description="Number of historical frames buffered")
 
 
 class CorridorBoundaryPoint(BaseModel):

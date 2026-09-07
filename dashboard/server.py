@@ -179,6 +179,25 @@ class SimulationEngineState:
             )
 
             speed_mps = math.hypot(obs.velocity.x, obs.velocity.y)
+            ax_ego = getattr(obs.acceleration, "x", 0.0) if hasattr(obs, "acceleration") else 0.0
+            ay_ego = getattr(obs.acceleration, "y", 0.0) if hasattr(obs, "acceleration") else 0.0
+            accel_mps2 = math.hypot(ax_ego, ay_ego)
+
+            hist_list = []
+            for h in getattr(obs, "history", []):
+                hwx, hwy = ego_to_world_2d(
+                    h.position.x, h.position.y,
+                    ego_state.pose.position.x, ego_state.pose.position.y,
+                    ego_state.pose.heading_rad
+                )
+                hist_list.append({
+                    "x": round(hwx, 2),
+                    "y": round(hwy, 2),
+                    "x_ego": round(h.position.x, 2),
+                    "y_ego": round(h.position.y, 2),
+                    "speed_mps": round(getattr(h, "speed_mps", 0.0), 2),
+                    "timestamp": round(getattr(h, "timestamp", 0.0), 2)
+                })
 
             actors_data.append({
                 "id": obs.id,
@@ -198,6 +217,13 @@ class SimulationEngineState:
                 "speed_kph": round(speed_mps * 3.6, 1),
                 "vx_ego": round(obs.velocity.x, 2),
                 "vy_ego": round(obs.velocity.y, 2),
+                "ax_ego": round(ax_ego, 2),
+                "ay_ego": round(ay_ego, 2),
+                "accel_mps2": round(accel_mps2, 2),
+                "intent": obs.inferred_intent.value if getattr(obs, "inferred_intent", None) else "CRUISING",
+                "estimated_risk": round(getattr(obs, "estimated_risk", 0.0), 2),
+                "history_length": getattr(obs, "history_length", len(hist_list)),
+                "history": hist_list,
                 "is_static": obs.is_static,
                 "safety_radius_m": round(max(obs.bbox.size.x, obs.bbox.size.y) * 0.6 + 0.5, 2)
             })
@@ -1445,7 +1471,36 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                 });
             });
 
-            // 8. Perceived Dynamic Obstacles (BBoxes + Velocity Arrows)
+            // 7b. Temporal Track Memory Breadcrumbs (Past Trajectory History)
+            (data.actors || []).forEach(act => {
+                const hist = act.history || [];
+                if (hist.length > 1) {
+                    ctx.beginPath();
+                    hist.forEach((hp, idx) => {
+                        const hScr = worldToScreen(hp.x, hp.y);
+                        if (idx === 0) ctx.moveTo(hScr.sx, hScr.sy);
+                        else ctx.lineTo(hScr.sx, hScr.sy);
+                    });
+                    ctx.strokeStyle = 'rgba(168, 85, 247, 0.45)';
+                    ctx.lineWidth = 1.5;
+                    ctx.setLineDash([2, 2]);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    hist.forEach((hp, idx) => {
+                        if (idx % 2 === 0 || idx === hist.length - 1) {
+                            const hScr = worldToScreen(hp.x, hp.y);
+                            const alpha = 0.2 + 0.7 * (idx / hist.length);
+                            ctx.fillStyle = `rgba(192, 132, 252, ${alpha})`;
+                            ctx.beginPath();
+                            ctx.arc(hScr.sx, hScr.sy, 2.2, 0, Math.PI * 2);
+                            ctx.fill();
+                        }
+                    });
+                }
+            });
+
+            // 8. Perceived Dynamic Obstacles (BBoxes + Velocity Arrows + Accel Vectors)
             (data.actors || []).forEach(act => {
                 const scr = worldToScreen(act.x_world, act.y_world);
                 const wPix = act.width_m * scale;
@@ -1469,7 +1524,7 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
 
                 ctx.restore();
 
-                // Velocity Vector Arrow
+                // Velocity Vector Arrow (Amber #f59e0b)
                 if (act.speed_mps > 0.3) {
                     const endX_world = act.x_world + act.vx_ego * 1.5;
                     const endY_world = act.y_world + act.vy_ego * 1.5;
@@ -1483,11 +1538,30 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                     ctx.stroke();
                 }
 
-                // Actor Label Badge
+                // Acceleration Vector Arrow (Purple #c084fc)
+                if (act.accel_mps2 > 0.4) {
+                    const aEndX_world = act.x_world + act.ax_ego * 1.0;
+                    const aEndY_world = act.y_world + act.ay_ego * 1.0;
+                    const aEndScr = worldToScreen(aEndX_world, aEndY_world);
+
+                    ctx.strokeStyle = '#c084fc';
+                    ctx.lineWidth = 2.0;
+                    ctx.beginPath();
+                    ctx.moveTo(scr.sx, scr.sy);
+                    ctx.lineTo(aEndScr.sx, aEndScr.sy);
+                    ctx.stroke();
+
+                    ctx.fillStyle = '#e9d5ff';
+                    ctx.font = 'bold 8px monospace';
+                    ctx.fillText(`a: ${act.accel_mps2}m/s²`, aEndScr.sx + 2, aEndScr.sy - 2);
+                }
+
+                // Actor Label Badge with Intent and Multi-Frame Memory Length
                 ctx.fillStyle = '#ffffff';
                 ctx.font = 'bold 10px monospace';
                 const ttcDesc = act.ttc_s ? ` | TTC ${act.ttc_s}s` : '';
-                ctx.fillText(`${icon} ${act.id} (${act.speed_kph}kph${ttcDesc})`, scr.sx + wPix / 2 + 5, scr.sy + 3);
+                const memDesc = act.history_length > 1 ? ` | ${act.history_length}f` : '';
+                ctx.fillText(`${icon} ${act.id} [${act.intent}] (${act.speed_kph}kph${ttcDesc}${memDesc})`, scr.sx + wPix / 2 + 5, scr.sy + 3);
             });
 
             // 9. Ego Vehicle Representation (Cockpit Bottom Origin)
