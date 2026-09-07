@@ -9,7 +9,6 @@ from interfaces import (
 
 class KinematicPredictor:
     """Generates multi-modal kinematic trajectory branches with uncertainty covariance
-
     and collision risk assessment for varied Indian road users (motorcycles, autos,
     pedestrians, cattle, and commercial vehicles).
     """
@@ -69,7 +68,7 @@ class KinematicPredictor:
         t0: float,
         ego_speed: float
     ) -> List[PredictedTrajectory]:
-        """Motorcycles exhibit high agility: straight cruise, obstacle weave, or cut-in."""
+        """Motorcycles exhibit high agility: straight continuation (60%), cut-in (25%), nudge/weave (15%)."""
         steps = int(self.horizon_seconds / self.dt)
         x0, y0 = obs.bbox.center.x, obs.bbox.center.y
         vx, vy = obs.velocity.x, obs.velocity.y
@@ -77,13 +76,13 @@ class KinematicPredictor:
 
         # Assign mode probabilities based on intent
         if intent == MotionIntent.CUTTING_IN:
-            p1, p2, p3 = 0.20, 0.15, 0.65
+            p1, p2, p3 = 0.20, 0.65, 0.15
         elif intent == MotionIntent.ERRATIC_SWERVE:
-            p1, p2, p3 = 0.25, 0.50, 0.25
-        else:
-            p1, p2, p3 = 0.65, 0.20, 0.15
+            p1, p2, p3 = 0.25, 0.30, 0.45
+        else: # Standard Cruising / Approaching
+            p1, p2, p3 = 0.60, 0.25, 0.15
 
-        # Mode 1: Continuation (CTRA / Constant Velocity)
+        # Mode 1: Continuation (Straight / Constant Velocity) -> 60%
         pts_t1 = []
         for step in range(1, steps + 1):
             dt_step = step * self.dt
@@ -100,39 +99,39 @@ class KinematicPredictor:
                 sigma_y=sig_y
             ))
 
-        # Mode 2: Nudge / Weave around obstacle (lateral offset +0.7m away from current path)
+        # Mode 2: Cut-in / Lane merge (merges toward center y -> 0) -> 25%
         pts_t2 = []
-        nudge_dir = 1.0 if y0 >= 0 else -1.0
-        for step in range(1, steps + 1):
-            dt_step = step * self.dt
-            fx = x0 + vx * dt_step
-            # Smooth lateral sigmoid nudge
-            lateral_offset = nudge_dir * 0.8 * (1.0 - math.exp(-1.5 * dt_step))
-            fy = y0 + vy * dt_step + lateral_offset
-            pts_t2.append(PredictedTrajectoryPoint(
-                timestamp=t0 + dt_step,
-                position=Point3D(x=fx, y=fy, z=obs.bbox.center.z),
-                velocity=Vector3D(x=vx, y=vy + nudge_dir * 0.5, z=0.0),
-                yaw_rad=yaw + nudge_dir * 0.15,
-                sigma_x=0.25 + 0.25 * dt_step,
-                sigma_y=0.25 + 0.35 * dt_step
-            ))
-
-        # Mode 3: Aggressive Cut-in / Lane merge (merges toward center y -> 0)
-        pts_t3 = []
         for step in range(1, steps + 1):
             dt_step = step * self.dt
             fx = x0 + vx * dt_step
             # Decays y towards center 0
             fy = y0 * math.exp(-1.8 * dt_step)
             lat_v = -1.8 * fy
-            pts_t3.append(PredictedTrajectoryPoint(
+            pts_t2.append(PredictedTrajectoryPoint(
                 timestamp=t0 + dt_step,
                 position=Point3D(x=fx, y=fy, z=obs.bbox.center.z),
                 velocity=Vector3D(x=vx, y=lat_v, z=0.0),
-                yaw_rad=math.atan2(lat_v, vx) if abs(vx) > 0.1 else yaw,
+                yaw_rad=math.atan2(lat_v, max(0.1, abs(vx))) if abs(vx) > 0.1 else yaw,
                 sigma_x=0.30 + 0.30 * dt_step,
                 sigma_y=0.30 + 0.40 * dt_step
+            ))
+
+        # Mode 3: Nudge / Weave away from center (lateral offset +0.7m away from current path) -> 15%
+        pts_t3 = []
+        nudge_dir = 1.0 if y0 >= 0 else -1.0
+        for step in range(1, steps + 1):
+            dt_step = step * self.dt
+            fx = x0 + vx * dt_step
+            # Smooth lateral sigmoid nudge outwards
+            lateral_offset = nudge_dir * 0.8 * (1.0 - math.exp(-1.5 * dt_step))
+            fy = y0 + vy * dt_step + lateral_offset
+            pts_t3.append(PredictedTrajectoryPoint(
+                timestamp=t0 + dt_step,
+                position=Point3D(x=fx, y=fy, z=obs.bbox.center.z),
+                velocity=Vector3D(x=vx, y=vy + nudge_dir * 0.5, z=0.0),
+                yaw_rad=yaw + nudge_dir * 0.15,
+                sigma_x=0.25 + 0.25 * dt_step,
+                sigma_y=0.25 + 0.35 * dt_step
             ))
 
         t1 = PredictedTrajectory(
@@ -143,13 +142,13 @@ class KinematicPredictor:
         )
         t2 = PredictedTrajectory(
             probability=p2,
-            mode_name="nudge_obstacle",
+            mode_name="cut_in_merge",
             collision_risk=self._calc_risk(pts_t2, p2, ego_speed),
             waypoints=pts_t2
         )
         t3 = PredictedTrajectory(
             probability=p3,
-            mode_name="cut_in_merge",
+            mode_name="nudge_obstacle",
             collision_risk=self._calc_risk(pts_t3, p3, ego_speed),
             waypoints=pts_t3
         )
@@ -171,7 +170,7 @@ class KinematicPredictor:
         if intent == MotionIntent.DECELERATING or intent == MotionIntent.STOPPING:
             p1, p2, p3 = 0.20, 0.60, 0.20
         elif intent == MotionIntent.CUTTING_IN:
-            p1, p2, p3 = 0.20, 0.15, 0.65
+            p1, p2, p3 = 0.20, 0.65, 0.15
         else:
             p1, p2, p3 = 0.60, 0.25, 0.15
 
@@ -188,7 +187,7 @@ class KinematicPredictor:
             for step in range(1, steps + 1)
         ]
 
-        # Mode 2: Decelerate / Roadside Halting (moves towards road curb while slowing down)
+        # Mode 2: Decelerate / Roadside Halting
         curb_y = 2.0 if y0 >= 0 else -2.0
         pts_t2 = []
         curr_vx = vx
@@ -260,47 +259,40 @@ class KinematicPredictor:
             for step in range(1, steps + 1)
         ]
 
-        # Mode 2: Hesitation / sudden stop mid-road
+        # Mode 2: Hesitation / Freeze in middle of road
         pts_t2 = []
+        curr_y = y0
         for step in range(1, steps + 1):
             dt_step = step * self.dt
-            # Velocity drops sharply
-            decay = math.exp(-2.5 * dt_step)
-            fx = x0 + vx * (1.0 - decay) / 2.5
-            fy = y0 + vy * (1.0 - decay) / 2.5
+            # Rapidly drop crossing speed
+            curr_y += vy * math.exp(-2.0 * dt_step) * self.dt
             pts_t2.append(PredictedTrajectoryPoint(
                 timestamp=t0 + dt_step,
-                position=Point3D(x=fx, y=fy, z=obs.bbox.center.z),
-                velocity=Vector3D(x=vx * decay, y=vy * decay, z=0.0),
+                position=Point3D(x=x0, y=curr_y, z=obs.bbox.center.z),
+                velocity=Vector3D(x=0.0, y=vy * math.exp(-2.0 * dt_step), z=0.0),
                 yaw_rad=yaw,
-                sigma_x=0.20 + 0.10 * dt_step,
-                sigma_y=0.20 + 0.15 * dt_step
+                sigma_x=0.15 + 0.15 * dt_step,
+                sigma_y=0.20 + 0.25 * dt_step
             ))
 
-        # Mode 3: Reversal (walks back towards starting shoulder)
+        # Mode 3: Retreat / Turn back to original shoulder
         pts_t3 = []
         for step in range(1, steps + 1):
             dt_step = step * self.dt
-            # Reverses lateral motion after 0.8s
-            if dt_step < 0.8:
-                fy = y0 + vy * dt_step
-                rev_vy = vy
-            else:
-                fy = y0 + vy * 0.8 - vy * (dt_step - 0.8)
-                rev_vy = -vy
+            retreat_y = y0 - (vy * 0.8) * dt_step
             pts_t3.append(PredictedTrajectoryPoint(
                 timestamp=t0 + dt_step,
-                position=Point3D(x=x0 + vx * dt_step * 0.5, y=fy, z=obs.bbox.center.z),
-                velocity=Vector3D(x=vx * 0.5, y=rev_vy, z=0.0),
-                yaw_rad=yaw + math.pi if rev_vy * vy < 0 else yaw,
-                sigma_x=0.25 + 0.15 * dt_step,
-                sigma_y=0.25 + 0.25 * dt_step
+                position=Point3D(x=x0, y=retreat_y, z=obs.bbox.center.z),
+                velocity=Vector3D(x=0.0, y=-vy * 0.8, z=0.0),
+                yaw_rad=yaw + math.pi,
+                sigma_x=0.20 + 0.15 * dt_step,
+                sigma_y=0.20 + 0.20 * dt_step
             ))
 
         return [
-            PredictedTrajectory(probability=p1, mode_name="constant_crossing", collision_risk=self._calc_risk(pts_t1, p1, ego_speed), waypoints=pts_t1),
+            PredictedTrajectory(probability=p1, mode_name="continue_crossing", collision_risk=self._calc_risk(pts_t1, p1, ego_speed), waypoints=pts_t1),
             PredictedTrajectory(probability=p2, mode_name="hesitate_halt", collision_risk=self._calc_risk(pts_t2, p2, ego_speed), waypoints=pts_t2),
-            PredictedTrajectory(probability=p3, mode_name="reversal_to_shoulder", collision_risk=self._calc_risk(pts_t3, p3, ego_speed), waypoints=pts_t3),
+            PredictedTrajectory(probability=p3, mode_name="retreat_back", collision_risk=self._calc_risk(pts_t3, p3, ego_speed), waypoints=pts_t3),
         ]
 
     def _predict_cattle_modes(
@@ -310,64 +302,57 @@ class KinematicPredictor:
         t0: float,
         ego_speed: float
     ) -> List[PredictedTrajectory]:
-        """Cattle: Slow drift, abrupt freeze/blocking road, erratic turning."""
+        """Cattle & Livestock: Slow wandering (50%), sudden freeze in carriageway (35%), turnback (15%)."""
         steps = int(self.horizon_seconds / self.dt)
         x0, y0 = obs.bbox.center.x, obs.bbox.center.y
         vx, vy = obs.velocity.x, obs.velocity.y
         yaw = obs.bbox.yaw_rad
 
-        p1, p2, p3 = 0.40, 0.45, 0.15
+        p1, p2, p3 = 0.50, 0.35, 0.15
 
-        # Mode 1: Slow continuous drift
+        # Mode 1: Slow continuous wander
         pts_t1 = [
             PredictedTrajectoryPoint(
                 timestamp=t0 + step * self.dt,
                 position=Point3D(x=x0 + vx * step * self.dt, y=y0 + vy * step * self.dt, z=obs.bbox.center.z),
                 velocity=Vector3D(x=vx, y=vy, z=0.0),
                 yaw_rad=yaw,
-                sigma_x=0.25 + 0.15 * step * self.dt,
-                sigma_y=0.25 + 0.25 * step * self.dt
+                sigma_x=0.20 + 0.15 * step * self.dt,
+                sigma_y=0.20 + 0.20 * step * self.dt
             )
             for step in range(1, steps + 1)
         ]
 
-        # Mode 2: Abrupt freeze in middle of road (high probability for cattle)
-        pts_t2 = []
-        for step in range(1, steps + 1):
-            dt_step = step * self.dt
-            decay = math.exp(-3.5 * dt_step)
-            fx = x0 + vx * (1.0 - decay) / 3.5
-            fy = y0 + vy * (1.0 - decay) / 3.5
-            pts_t2.append(PredictedTrajectoryPoint(
-                timestamp=t0 + dt_step,
-                position=Point3D(x=fx, y=fy, z=obs.bbox.center.z),
+        # Mode 2: Road freeze / Standstill in carriageway
+        pts_t2 = [
+            PredictedTrajectoryPoint(
+                timestamp=t0 + step * self.dt,
+                position=Point3D(x=x0 + vx * 0.2 * step * self.dt, y=y0 + vy * 0.2 * step * self.dt, z=obs.bbox.center.z),
                 velocity=Vector3D(x=0.0, y=0.0, z=0.0),
                 yaw_rad=yaw,
-                sigma_x=0.15 + 0.08 * dt_step,
-                sigma_y=0.15 + 0.10 * dt_step
-            ))
+                sigma_x=0.25 + 0.10 * step * self.dt,
+                sigma_y=0.25 + 0.10 * step * self.dt
+            )
+            for step in range(1, steps + 1)
+        ]
 
-        # Mode 3: Erratic 45 deg wander / direction change
-        veer_angle = 0.60
-        pts_t3 = []
-        for step in range(1, steps + 1):
-            dt_step = step * self.dt
-            sp = math.sqrt(vx * vx + vy * vy)
-            new_vx = sp * math.cos(yaw + veer_angle)
-            new_vy = sp * math.sin(yaw + veer_angle)
-            pts_t3.append(PredictedTrajectoryPoint(
-                timestamp=t0 + dt_step,
-                position=Point3D(x=x0 + new_vx * dt_step, y=y0 + new_vy * dt_step, z=obs.bbox.center.z),
-                velocity=Vector3D(x=new_vx, y=new_vy, z=0.0),
-                yaw_rad=yaw + veer_angle,
-                sigma_x=0.30 + 0.25 * dt_step,
-                sigma_y=0.30 + 0.35 * dt_step
-            ))
+        # Mode 3: Sudden turnback
+        pts_t3 = [
+            PredictedTrajectoryPoint(
+                timestamp=t0 + step * self.dt,
+                position=Point3D(x=x0 - vx * 0.5 * step * self.dt, y=y0 - vy * 0.5 * step * self.dt, z=obs.bbox.center.z),
+                velocity=Vector3D(x=-vx * 0.5, y=-vy * 0.5, z=0.0),
+                yaw_rad=yaw + math.pi,
+                sigma_x=0.30 + 0.20 * step * self.dt,
+                sigma_y=0.30 + 0.25 * step * self.dt
+            )
+            for step in range(1, steps + 1)
+        ]
 
         return [
-            PredictedTrajectory(probability=p1, mode_name="slow_drift", collision_risk=self._calc_risk(pts_t1, p1, ego_speed), waypoints=pts_t1),
+            PredictedTrajectory(probability=p1, mode_name="slow_wander", collision_risk=self._calc_risk(pts_t1, p1, ego_speed), waypoints=pts_t1),
             PredictedTrajectory(probability=p2, mode_name="road_freeze", collision_risk=self._calc_risk(pts_t2, p2, ego_speed), waypoints=pts_t2),
-            PredictedTrajectory(probability=p3, mode_name="erratic_veer", collision_risk=self._calc_risk(pts_t3, p3, ego_speed), waypoints=pts_t3),
+            PredictedTrajectory(probability=p3, mode_name="turnback", collision_risk=self._calc_risk(pts_t3, p3, ego_speed), waypoints=pts_t3),
         ]
 
     def _predict_vehicle_modes(
@@ -377,18 +362,13 @@ class KinematicPredictor:
         t0: float,
         ego_speed: float
     ) -> List[PredictedTrajectory]:
-        """Cars, Trucks, Buses: Forward continuation, lane nudge, or braking."""
+        """Heavy vehicles, trucks, tractors, and cars."""
         steps = int(self.horizon_seconds / self.dt)
         x0, y0 = obs.bbox.center.x, obs.bbox.center.y
         vx, vy = obs.velocity.x, obs.velocity.y
         yaw = obs.bbox.yaw_rad
 
-        if intent == MotionIntent.DECELERATING:
-            p1, p2, p3 = 0.25, 0.60, 0.15
-        elif intent == MotionIntent.CUTTING_IN:
-            p1, p2, p3 = 0.25, 0.15, 0.60
-        else:
-            p1, p2, p3 = 0.70, 0.20, 0.10
+        p1, p2, p3 = 0.70, 0.20, 0.10
 
         pts_t1 = [
             PredictedTrajectoryPoint(
@@ -402,7 +382,6 @@ class KinematicPredictor:
             for step in range(1, steps + 1)
         ]
 
-        # Mode 2: Deceleration
         pts_t2 = []
         for step in range(1, steps + 1):
             dt_step = step * self.dt
@@ -417,7 +396,6 @@ class KinematicPredictor:
                 sigma_y=0.20 + 0.15 * dt_step
             ))
 
-        # Mode 3: Lateral Swerve / Nudge
         nudge_dir = 1.0 if y0 >= 0 else -1.0
         pts_t3 = [
             PredictedTrajectoryPoint(
@@ -454,7 +432,6 @@ class KinematicPredictor:
             if dist < min_d:
                 min_d = dist
 
-        # Closer distance yields higher risk, weighted by mode probability
         if min_d < 2.5:
             base_risk = 1.0 - (min_d / 2.5)
             return round(min(1.0, max(0.0, base_risk * (0.5 + 0.5 * prob))), 3)

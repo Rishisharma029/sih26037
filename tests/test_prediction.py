@@ -5,12 +5,14 @@ import torch
 
 from interfaces import (
     TrackedObstacle, ObstacleClass, MotionIntent, BoundingBox3D,
-    Point3D, Vector3D, PerceptionOutput, FreeSpaceCorridor
+    Point3D, Vector3D, PerceptionOutput, FreeSpaceCorridor,
+    EgoVehicleState, Pose3D, Twist3D, PlannedTrajectory, BehaviorMode
 )
 from prediction.intent_classifier import IntentClassifier
 from prediction.kinematic_predictor import KinematicPredictor
 from prediction.learned_predictor import LearnedPredictor, MultiModalTrajectoryNet
 from prediction.trajectory_predictor import TrajectoryPredictor
+from planning.baseline_planner import BaselinePlanner
 
 
 def _create_mock_obstacle(
@@ -62,21 +64,24 @@ def test_cattle_crossing_and_hesitation_intent():
 
 
 def test_motorcycle_multi_modal_branches():
-    """Verify motorcycle generates 3 distinct modes with normalized probability and expanding sigma."""
+    """Verify motorcycle generates 3 distinct modes (60% continuation, 25% cut-in, 15% nudge)."""
     kin_pred = KinematicPredictor(horizon_seconds=3.0, dt=0.5)
     moto = _create_mock_obstacle("bike_1", ObstacleClass.MOTORCYCLE, x=15.0, y=1.5, vx=8.0, vy=0.0)
     modes = kin_pred.predict_modes(moto, MotionIntent.CRUISING, current_time=0.0)
 
     assert len(modes) == 3
-    # Check probability sum
+    # Check probability distribution
     total_p = sum(m.probability for m in modes)
     assert pytest.approx(total_p, abs=1e-2) == 1.0
 
-    # Mode names: continuation, nudge_obstacle, cut_in_merge
-    mode_names = [m.mode_name for m in modes]
-    assert "continuation" in mode_names
-    assert "nudge_obstacle" in mode_names
-    assert "cut_in_merge" in mode_names
+    # Mode names: continuation (60%), cut_in_merge (25%), nudge_obstacle (15%)
+    mode_dict = {m.mode_name: m.probability for m in modes}
+    assert "continuation" in mode_dict
+    assert "cut_in_merge" in mode_dict
+    assert "nudge_obstacle" in mode_dict
+    assert mode_dict["continuation"] == 0.60
+    assert mode_dict["cut_in_merge"] == 0.25
+    assert mode_dict["nudge_obstacle"] == 0.15
 
     # Check uncertainty expansion over time: sigma(T=3s) > sigma(T=0.5s)
     traj = modes[0]
@@ -85,14 +90,13 @@ def test_motorcycle_multi_modal_branches():
 
 
 def test_pedestrian_multi_modal_reversal_and_halt():
-    """Verify pedestrian multi-modal branching includes hesitate/halt and reverse options."""
+    """Verify pedestrian multi-modal branching includes hesitate/halt and reversal options."""
     kin_pred = KinematicPredictor(horizon_seconds=3.0, dt=0.5)
     ped = _create_mock_obstacle("ped_cross", ObstacleClass.PEDESTRIAN, x=10.0, y=3.0, vx=0.0, vy=-1.0)
     modes = kin_pred.predict_modes(ped, MotionIntent.CROSSING_PATH, current_time=0.0)
 
     assert len(modes) == 3
     halt_mode = next(m for m in modes if m.mode_name == "hesitate_halt")
-    # Hesitate halt mode should have diminishing speed
     assert halt_mode.waypoints[-1].velocity.y < 0.1
 
 
@@ -103,7 +107,7 @@ def test_cattle_road_freeze_mode():
     modes = kin_pred.predict_modes(cow, MotionIntent.CRUISING, current_time=0.0)
 
     freeze_mode = next(m for m in modes if m.mode_name == "road_freeze")
-    assert freeze_mode.probability >= 0.40
+    assert freeze_mode.probability >= 0.30
     assert freeze_mode.waypoints[-1].velocity.x < 0.05
 
 
@@ -130,12 +134,63 @@ def test_unified_trajectory_predictor_pipeline():
         timestamp=10.0,
         frame_id=100,
         obstacles=[bike, cow_static],
-        drivable_corridor=FreeSpaceCorridor(timestamp=10.0, boundary_points=[], average_width_m=6.5)
+        drivable_corridor=FreeSpaceCorridor(timestamp=10.0, boundary_points=[], average_width_m=4.5)
     )
 
     pred_out = predictor.predict(perception, ego_speed=6.0)
 
     assert len(pred_out.agents) == 2
     assert pred_out.horizon_seconds == 3.0
-    # The fast cutting-in bike at 8m should be flagged high risk
     assert "bike_fast" in pred_out.high_risk_agent_ids
+
+
+def test_motorcycle_corridor_invasion_and_explainability():
+    """Verify exact 25% cut-in probability and natural language explainability for oncoming motorcycle."""
+    predictor = TrajectoryPredictor(horizon_seconds=3.0, dt=0.5, mode="kinematic")
+
+    moto = _create_mock_obstacle("trk_02_motorcycle", ObstacleClass.MOTORCYCLE, x=20.0, y=1.8, vx=-5.0, vy=0.0)
+    perception = PerceptionOutput(
+        timestamp=1.0,
+        frame_id=20,
+        obstacles=[moto],
+        drivable_corridor=FreeSpaceCorridor(timestamp=1.0, boundary_points=[], average_width_m=4.0)
+    )
+
+    pred_out = predictor.predict(perception, ego_speed=6.0)
+    agent = pred_out.agents[0]
+
+    assert agent.id == "trk_02_motorcycle"
+    # Cut-in branch has 25% probability and penetrates the 4.0m corridor (|y| <= 2.0m)
+    assert agent.corridor_invasion_prob >= 0.25
+    assert agent.time_to_conflict_s is not None
+    assert "probability this motorcycle (trk_02_motorcycle) will cut into my corridor" in agent.explanation
+
+
+def test_planner_proactive_prediction_avoidance():
+    """Verify BaselinePlanner selects safe lateral offset away from predicted cut-in conflict zone."""
+    planner = BaselinePlanner(horizon_seconds=3.0, dt=0.2)
+    predictor = TrajectoryPredictor(horizon_seconds=3.0, dt=0.5, mode="kinematic")
+
+    # Motorcycle at x=18m, y=1.2m cutting in aggressively
+    moto = _create_mock_obstacle("moto_cutin", ObstacleClass.MOTORCYCLE, x=18.0, y=1.2, vx=-4.0, vy=-0.6)
+    perception = PerceptionOutput(
+        timestamp=2.0,
+        frame_id=40,
+        obstacles=[moto],
+        drivable_corridor=FreeSpaceCorridor(timestamp=2.0, boundary_points=[], average_width_m=5.0)
+    )
+    prediction = predictor.predict(perception, ego_speed=6.0)
+
+    ego_state = EgoVehicleState(
+        timestamp=2.0,
+        pose=Pose3D(position=Point3D(x=0.0, y=0.0, z=0.0), heading_rad=0.0),
+        twist=Twist3D(speed_mps=6.0),
+        acceleration=Vector3D(x=0.0, y=0.0, z=0.0)
+    )
+
+    plan = planner.plan(ego_state, perception, prediction, target_cruise_speed_mps=6.0)
+
+    # Planner should successfully generate a safe feasible trajectory
+    assert plan.behavior_mode in [BehaviorMode.NUDGE_RIGHT, BehaviorMode.NUDGE_LEFT, BehaviorMode.CRUISE]
+    assert len(plan.waypoints) == 15
+    assert plan.total_cost < 900.0

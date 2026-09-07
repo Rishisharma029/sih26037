@@ -5,7 +5,7 @@ Provides the foundational adaptive path generation stage:
 1. Reference path generation
 2. Discrete candidate lateral offsets:
      ?d ? {-1.5m, -1.0m, -0.5m, 0.0m, +0.5m, +1.0m, +1.5m}
-3. Dynamic collision checking against perceived obstacles
+3. Dynamic collision checking against perceived obstacles and spatio-temporal predictions
 4. Hard road corridor boundary validation
 5. Optimal feasible candidate selection with kinematic completeness
    (waypoints, curvature, speed, acceleration, and jerk)
@@ -22,8 +22,8 @@ class BaselinePlanner:
     """Candidate Lateral Offset Baseline Planner.
     
     Generates a bundle of discrete lateral offset trajectories, evaluates them
-    against obstacle collisions and road corridor boundaries, and selects the
-    safest minimal-offset feasible path.
+    against obstacle collisions, multi-modal predicted conflict zones, and road
+    corridor boundaries, and selects the safest minimal-offset feasible path.
     """
 
     def __init__(
@@ -161,9 +161,36 @@ class BaselinePlanner:
                 if is_collision:
                     break
 
+                # Check Spatio-Temporal Collision with Multi-Modal Forecasts
+                if prediction and prediction.agents:
+                    t_target = perception.timestamp + t
+                    for ag in prediction.agents:
+                        for traj in ag.trajectories:
+                            if not traj.waypoints:
+                                continue
+                            # Find closest predicted point in time
+                            pred_pt = min(traj.waypoints, key=lambda p: abs(p.timestamp - t_target))
+                            if abs(pred_pt.timestamp - t_target) <= (self.dt * 1.5):
+                                p_dx = abs(s_val - pred_pt.position.x)
+                                p_dy = abs(d_val - pred_pt.position.y)
+                                if p_dx < 2.0 and p_dy < (self.vehicle_half_width + 0.10):
+                                    if traj.probability >= 0.45:
+                                        is_collision = True
+                                        collision_obs_id = f"PREDICTED_CONFLICT_{ag.id}_{traj.mode_name}"
+                                        collision_pt = {"x": round(wx, 3), "y": round(wy, 3)}
+                                        break
+                                    elif traj.probability >= 0.15:
+                                        # Proactive collision avoidance penalty
+                                        anomaly_cost += traj.probability * 12.0
+
+                        if is_collision:
+                            break
+
+                if is_collision:
+                    break
+
                 # Check Collision / Penalty with Road Anomalies (Potholes, Gravel heaps)
                 for anom in perception.anomalies:
-                    # Anomaly distance from vehicle position (wx, wy)
                     adx = wx - anom.position.x
                     ady = wy - anom.position.y
                     adist = math.hypot(adx, ady)
@@ -193,89 +220,84 @@ class BaselinePlanner:
                 ))
 
             if not is_collision and len(waypoints) == num_steps:
-                # Candidate Cost = |offset| * 2.5 + (deviation penalty) + anomaly_cost
-                cost = abs(offset) * 2.5 + (0.5 if offset != 0.0 else 0.0) + anomaly_cost
+                # Cost function: offset displacement penalty + lateral acceleration/jerk penalty + anomaly penalty
+                max_lat_accel = max(abs(wp.curvature) * (wp.speed_mps ** 2) for wp in waypoints)
+                cost = (
+                    abs(offset) * 1.5 +          # Prefer center alignment
+                    (offset ** 2) * 0.8 +         # Quadratic penalty for extreme offsets
+                    max_lat_accel * 2.0 +         # Passenger comfort penalty
+                    anomaly_cost                  # Road surface & prediction penalty
+                )
 
-                if offset > 0.25:
-                    mode = BehaviorMode.NUDGE_LEFT
-                elif offset < -0.25:
-                    mode = BehaviorMode.NUDGE_RIGHT
-                else:
+                if abs(offset) < 0.05:
                     mode = BehaviorMode.CRUISE
+                elif offset > 0:
+                    mode = BehaviorMode.NUDGE_LEFT
+                else:
+                    mode = BehaviorMode.NUDGE_RIGHT
 
                 scored_candidates.append((cost, offset, waypoints, mode))
                 raw_candidates_info.append({
-                    "offset": offset,
-                    "is_feasible": True,
-                    "is_selected": False,
+                    "offset_m": offset,
+                    "status": "FEASIBLE",
                     "cost": round(cost, 2),
                     "mode": mode.value,
-                    "rejection_reason": "CLEAR",
-                    "waypoints": [{"x": wp.x, "y": wp.y} for wp in waypoints]
+                    "sample_pts": [{"x": wp.x, "y": wp.y} for wp in waypoints[::2]]
                 })
             else:
                 raw_candidates_info.append({
-                    "offset": offset,
-                    "is_feasible": False,
-                    "is_selected": False,
-                    "cost": 9999.0,
-                    "mode": "COLLISION",
-                    "rejection_reason": f"COLLISION ({collision_obs_id})" if collision_obs_id else "INCOMPLETE",
+                    "offset_m": offset,
+                    "status": "COLLISION",
+                    "reason": collision_obs_id,
                     "collision_point": collision_pt,
-                    "collision_obstacle_id": collision_obs_id,
-                    "waypoints": [{"x": wp.x, "y": wp.y} for wp in waypoints]
+                    "cost": 9999.0,
+                    "sample_pts": [{"x": wp.x, "y": wp.y} for wp in waypoints[::2]] if waypoints else []
                 })
 
-        # 2. Select optimal feasible candidate
+        self.last_candidates_summary = raw_candidates_info
+
+        # 2. Candidate Selection or Fallback Emergency Stop
         if scored_candidates:
-            # Sort by cost ascending (prefers center offset 0.0m if clear, otherwise minimal nudge)
+            # Sort by lowest total cost
             scored_candidates.sort(key=lambda x: x[0])
-            best_cost, best_offset, best_wps, best_mode = scored_candidates[0]
-
-            for cand in raw_candidates_info:
-                if cand["offset"] == best_offset and cand["is_feasible"]:
-                    cand["is_selected"] = True
-
-            self.last_candidates_summary = raw_candidates_info
+            best_cost, best_offset, best_waypoints, best_mode = scored_candidates[0]
 
             return PlannedTrajectory(
-                trajectory_id=f"baseline_opt_{self.plan_counter}_offset_{best_offset:+.1f}",
                 timestamp=ego_state.timestamp,
+                trajectory_id=f"plan_{self.plan_counter}_{best_mode.value}",
                 behavior_mode=best_mode,
-                waypoints=best_wps,
-                target_speed_mps=v_target,
+                target_speed_mps=round(v_target, 2),
                 total_cost=round(best_cost, 2),
-                is_feasible=True
+                waypoints=best_waypoints
             )
+        else:
+            # All offsets blocked -> Generate Emergency Safe Stop Trajectory
+            emergency_wps: List[TrajectoryPoint] = []
+            stop_dist = max(0.5, (current_speed ** 2) / (2.0 * 3.5)) # Decel at 3.5 m/s2
+            for i in range(1, num_steps + 1):
+                t = i * self.dt
+                speed_t = max(0.0, current_speed - 3.5 * t)
+                s_t = current_speed * t - 0.5 * 3.5 * (t ** 2) if speed_t > 0 else stop_dist
+                cos_h = math.cos(current_yaw)
+                sin_h = math.sin(current_yaw)
+                wx = current_x + s_t * cos_h
+                wy = current_y + s_t * sin_h
+                emergency_wps.append(TrajectoryPoint(
+                    timestamp=ego_state.timestamp + t,
+                    x=round(wx, 3),
+                    y=round(wy, 3),
+                    yaw_rad=round(current_yaw, 4),
+                    curvature=0.0,
+                    speed_mps=round(speed_t, 2),
+                    acceleration_mps2=-3.5 if speed_t > 0 else 0.0,
+                    jerk_mps3=0.0
+                ))
 
-        # 3. Fallback: All lateral offsets are blocked -> execute safe emergency stop directly ahead
-        self.last_candidates_summary = raw_candidates_info
-        fallback_wps: List[TrajectoryPoint] = []
-        speed_decay = current_speed
-        for i in range(1, num_steps + 1):
-            t = i * self.dt
-            speed_decay = max(0.0, speed_decay - 3.5 * self.dt)
-            dist_step = speed_decay * self.dt
-            wx = current_x + dist_step * (i * 0.5) * math.cos(current_yaw)
-            wy = current_y + dist_step * (i * 0.5) * math.sin(current_yaw)
-
-            fallback_wps.append(TrajectoryPoint(
-                timestamp=ego_state.timestamp + t,
-                x=round(wx, 3),
-                y=round(wy, 3),
-                yaw_rad=current_yaw,
-                curvature=0.0,
-                speed_mps=round(speed_decay, 2),
-                acceleration_mps2=-3.5 if speed_decay > 0.0 else 0.0,
-                jerk_mps3=0.0
-            ))
-
-        return PlannedTrajectory(
-            trajectory_id=f"baseline_stop_{self.plan_counter}",
-            timestamp=ego_state.timestamp,
-            behavior_mode=BehaviorMode.EMERGENCY_STOP,
-            waypoints=fallback_wps,
-            target_speed_mps=0.0,
-            total_cost=9999.0,
-            is_feasible=False
-        )
+            return PlannedTrajectory(
+                timestamp=ego_state.timestamp,
+                trajectory_id=f"plan_{self.plan_counter}_EMERGENCY_STOP",
+                behavior_mode=BehaviorMode.EMERGENCY_STOP,
+                target_speed_mps=0.0,
+                total_cost=999.0,
+                waypoints=emergency_wps
+            )

@@ -228,6 +228,9 @@ class PredictedAgent(BaseModel):
     primary_intent: MotionIntent
     trajectories: List[PredictedTrajectory] = Field(default_factory=list)
     is_high_risk: bool = Field(False, description="Flagged if potential conflict path exists")
+    corridor_invasion_prob: float = Field(0.0, ge=0.0, le=1.0, description="Probability of entering/cutting into ego corridor")
+    time_to_conflict_s: Optional[float] = Field(None, description="Estimated time until corridor conflict in seconds")
+    explanation: str = Field("", description="Explainable natural language reasoning for prediction")
 
 
 class PredictionOutput(BaseModel):

@@ -6,20 +6,20 @@ Features:
    - 3D Bounding Box monocular estimation.
    - Multi-Object Tracking (MOT) with persistent track IDs.
    - Constant-Velocity Kalman Filter estimating linear velocities (vx, vy).
-2. Unstructured Indian Road Geometry:
+2. Probabilistic Multi-Modal Motion Prediction:
+   - Multi-branch trajectory forecasting (Continuation 60%, Cut-in 25%, Nudge 15%).
+   - Dynamic Corridor Invasion Probability & Time-to-Conflict assessment.
+   - Explainable natural language reasoning ("There is a 25% probability this motorcycle will cut into my corridor").
+   - Expanding spatial uncertainty covariance ellipses (sigma_x, sigma_y).
+3. Unstructured Indian Road Geometry:
    - Non-rectangular irregular boundaries, variable width (3.4m choke points -> 5.6m passing bays).
    - Continuous curvature, eroded shoulder verges, ditch drop-offs.
    - Potholes, severe craters, speed bumps, and blocked gravel patches.
-3. Real-Time Autonomous Driving Debug BEV:
+4. Real-Time Autonomous Driving Debug BEV:
    - Organic road contour & unpaved shoulder hatching.
-   - Pothole & road anomaly warning zones.
-   - Obstacles with velocity vectors & bounding boxes.
-   - Multi-modal motion predictions with timestamp waypoints.
-   - 7-candidate trajectory bundle adapting to variable corridor & anomalies.
-   - Selected safe trajectory with speed profile.
-   - Dynamic vehicle safety envelope & collision zones.
-   - 30m Lookahead goal indicator & metric range arcs.
-4. 5-Stage Causal Decision HUD Stepper.
+   - Multi-modal motion forecast branches with percentage probability badges.
+   - 7-candidate trajectory bundle adapting proactively to predicted cut-in paths.
+5. 5-Stage Causal Decision HUD Stepper & Probabilistic Prediction Panel.
 """
 import sys
 import os
@@ -48,11 +48,11 @@ from perception.perception_pipeline import UnifiedPerceptionPipeline, Perception
 from perception.boundary_detector import FreeSpaceBoundaryDetector
 from prediction.trajectory_predictor import TrajectoryPredictor
 from planning.baseline_planner import BaselinePlanner
-from coordinates import transform_actor_to_ego_tracked_obstacle, world_to_ego_2d
+from coordinates import transform_actor_to_ego_tracked_obstacle, world_to_ego_2d, ego_to_world_2d
 
 class HazardSpawnRequest(BaseModel):
-    hazard_type: str = "tractor" # tractor | pedestrian | auto | pothole
-    distance_ahead_m: float = 35.0
+    hazard_type: str = "motorcycle" # tractor | motorcycle | pedestrian | auto | cattle | pothole
+    distance_ahead_m: float = 30.0
 
 class DifficultyRequest(BaseModel):
     difficulty: str = "HARD" # EASY | MEDIUM | HARD | EXTREME
@@ -104,13 +104,17 @@ class SimulationEngineState:
         self.perception_pipeline.tracker.tracks.clear()
         self.step()
 
-    def spawn_hazard(self, hazard_type: str, dist_ahead: float = 35.0):
+    def spawn_hazard(self, hazard_type: str, dist_ahead: float = 30.0):
         if hazard_type == "tractor":
             self.scenario.spawn_oncoming_tractor(dist_ahead=dist_ahead, y=0.7, speed_mps=3.5)
+        elif hazard_type == "motorcycle":
+            self.scenario.spawn_oncoming_motorcycle(dist_ahead=dist_ahead, y=1.3, speed_mps=5.2)
         elif hazard_type == "pedestrian":
             self.scenario.spawn_crossing_pedestrian(dist_ahead=max(15.0, dist_ahead * 0.6), start_y=-2.0, speed_mps=1.4)
         elif hazard_type == "auto":
             self.scenario.spawn_parked_auto(dist_ahead=max(15.0, dist_ahead * 0.5), y=0.9)
+        elif hazard_type == "cattle":
+            self.scenario.spawn_cattle(dist_ahead=max(18.0, dist_ahead * 0.7), y=-1.1, speed_mps=0.6)
         elif hazard_type == "pothole":
             p_x, p_y, _ = self.scenario.env.geometry.frenet_to_cartesian(self.scenario.simulator.state.pose.position.x + 18.0, 0.0)
             self.scenario.env.add_anomaly(RoadAnomaly(
@@ -155,8 +159,6 @@ class SimulationEngineState:
             ttc_eval = self.supervisory.ttc_calc.compute_ttc(ego_state, [obs])
             ttc_val = ttc_eval.min_ttc_seconds if ttc_eval.min_ttc_seconds < 100.0 else None
 
-            # World position reconstruction for rendering
-            from coordinates import ego_to_world_2d
             wx, wy = ego_to_world_2d(
                 obs.bbox.center.x, obs.bbox.center.y,
                 ego_state.pose.position.x, ego_state.pose.position.y,
@@ -222,20 +224,17 @@ class SimulationEngineState:
             steering_angle_rad=steer,
             throttle_pct=throttle,
             brake_pct=brake,
-            gear=GearMode.DRIVE,
-            emergency_brake_active=self.is_emergency_stop or safe_traj.is_emergency_stop
+            gear=GearMode.DRIVE if not self.is_emergency_stop else GearMode.PARK,
+            emergency_brake_active=self.is_emergency_stop
         )
 
-        # 6. Physics & Vehicle Dynamics Step
+        # 6. Physical Vehicle Step
         state, raw_sensor = self.scenario.run_step(cmd)
         self.step_count += 1
 
-        # 7. Road Boundary & Margin Calculations
-        s_post, d_post = self.scenario.env.geometry.cartesian_to_frenet(
-            state.pose.position.x,
-            state.pose.position.y,
-            s_guess=s_curr
-        )
+        # 7. Post-step evaluation & telemetry extraction
+        state = self.scenario.simulator.state
+        s_post, d_post = self.scenario.env.geometry.cartesian_to_frenet(state.pose.position.x, state.pose.position.y)
         d_left, d_right = self.scenario.env.geometry.get_corridor_widths(s_post)
         curr_width = d_left - d_right
         margin = self.scenario.env.geometry.get_ditch_margin(s_post, d_post, vehicle_half_width=0.90)
@@ -265,45 +264,58 @@ class SimulationEngineState:
                 "depth_or_height_m": round(anom.depth_or_height_m, 2)
             })
 
-        # 9. Format Multi-Modal Predictions
+        # 9. Format Multi-Modal Predictions with Explainability & Corridor Invasion
         predictions_data = []
         for agent in pred_out.agents:
             trajs_data = []
             for t in agent.trajectories:
+                # Convert predicted waypoints in ego relative frame to world coordinates
+                pts_list = []
+                for pt in t.waypoints:
+                    pwx, pwy = ego_to_world_2d(
+                        pt.position.x, pt.position.y,
+                        ego_state.pose.position.x, ego_state.pose.position.y,
+                        ego_state.pose.heading_rad
+                    )
+                    pts_list.append({
+                        "x": round(pwx, 2),
+                        "y": round(pwy, 2),
+                        "x_ego": round(pt.position.x, 2),
+                        "y_ego": round(pt.position.y, 2),
+                        "sigma_x": round(pt.sigma_x, 2),
+                        "sigma_y": round(pt.sigma_y, 2),
+                        "time_offset_s": round(pt.timestamp - ego_state.timestamp, 2)
+                    })
                 trajs_data.append({
                     "mode_name": t.mode_name,
                     "probability": round(t.probability, 2),
+                    "probability_pct": int(round(t.probability * 100)),
                     "collision_risk": round(t.collision_risk, 2),
-                    "waypoints": [
-                        {
-                            "x": round(pt.position.x, 2),
-                            "y": round(pt.position.y, 2),
-                            "sigma_x": round(pt.sigma_x, 2),
-                            "sigma_y": round(pt.sigma_y, 2),
-                            "time_offset_s": round(pt.timestamp - ego_state.timestamp, 2)
-                        }
-                        for pt in t.waypoints
-                    ]
+                    "waypoints": pts_list
                 })
             predictions_data.append({
                 "id": agent.id,
                 "class": agent.obstacle_class.value,
                 "intent": agent.primary_intent.value,
                 "is_high_risk": agent.is_high_risk,
+                "corridor_invasion_prob": round(agent.corridor_invasion_prob, 2),
+                "corridor_invasion_pct": int(round(agent.corridor_invasion_prob * 100)),
+                "time_to_conflict_s": agent.time_to_conflict_s,
+                "explanation": agent.explanation,
                 "trajectories": trajs_data
             })
 
         # 10. Extract Collision Zones from Candidates
         collision_zones = []
         for cand in self.planner.last_candidates_summary:
-            if not cand.get("is_feasible") and cand.get("collision_point"):
+            if cand.get("status") == "COLLISION" and cand.get("collision_point"):
                 cp = cand["collision_point"]
                 collision_zones.append({
                     "x": cp["x"],
                     "y": cp["y"],
                     "radius_m": 1.6,
-                    "obstacle_id": cand.get("collision_obstacle_id", "BARRIER"),
-                    "offset_m": cand.get("offset", 0.0)
+                    "obstacle_id": cand.get("reason", "BARRIER"),
+                    "offset_m": cand.get("offset_m", 0.0)
                 })
 
         # 11. 30m Lookahead Goal Direction & Road Polyline
@@ -331,6 +343,12 @@ class SimulationEngineState:
                 if lead_threat is None or (a["ttc_s"] or 999) < (lead_threat["ttc_s"] or 999):
                     lead_threat = a
 
+        lead_pred = None
+        for p in predictions_data:
+            if p["is_high_risk"] or p["corridor_invasion_pct"] >= 20:
+                lead_pred = p
+                break
+
         lead_anomaly = None
         for an in anomalies_data:
             if 0 < an["x_ego"] < 25.0 and abs(an["y_ego"]) < 1.2 and abs(an["depth_or_height_m"]) > 0.07:
@@ -338,164 +356,156 @@ class SimulationEngineState:
                     lead_anomaly = an
 
         has_threat = lead_threat is not None and ((lead_threat["ttc_s"] is not None and lead_threat["ttc_s"] < 5.0) or lead_threat["distance_m"] < 25.0)
-        chosen_cand = next((c for c in self.planner.last_candidates_summary if c.get("is_selected")), None)
-        center_cand = next((c for c in self.planner.last_candidates_summary if c.get("offset") == 0.0), None)
 
-        road_status_tag = "CHOKE_POINT" if curr_width < 3.8 else ("PASSING_BAY" if curr_width > 5.0 else "NOMINAL_ROAD")
-
-        action_text = ""
-        if has_threat and chosen_cand:
-            action_text = (
-                f"🚨 {lead_threat['id'].upper()} IN PATH (@ {lead_threat['distance_m']}m, TTC {lead_threat['ttc_s']}s) → "
-                f"Nominal: UNSAFE → Selected: {planned_traj.behavior_mode.value} ({chosen_cand['offset']:+.1f}m) → "
-                f"Steering: {math.degrees(cmd.steering_angle_rad):+.1f}°"
-            )
-        elif lead_anomaly and chosen_cand and chosen_cand["offset"] != 0.0:
-            action_text = (
-                f"⚠️ {lead_anomaly['type']} AHEAD (@ {lead_anomaly['distance_m']}m) → "
-                f"Adaptive Nudge ({chosen_cand['offset']:+.1f}m) to Avoid Crater"
-            )
-        else:
-            action_text = f"✅ PATH CLEAR — Cruising Corridor (Width {curr_width:.1f}m, Offset 0.0m)"
+        # Selected lateral offset
+        selected_offset = 0.0
+        if safe_traj.waypoints:
+            last_wp = safe_traj.waypoints[-1]
+            _, d_end = self.scenario.env.geometry.cartesian_to_frenet(last_wp.x, last_wp.y)
+            selected_offset = round(d_end, 2)
 
         causal_event = {
-            "has_hazard": has_threat or (lead_anomaly is not None and chosen_cand and chosen_cand["offset"] != 0.0),
-            "hazard_id": lead_threat["id"] if lead_threat else (lead_anomaly["id"] if lead_anomaly else "None"),
-            "hazard_class": lead_threat["class"] if lead_threat else (lead_anomaly["type"] if lead_anomaly else "None"),
-            "hazard_dist_m": lead_threat["distance_m"] if lead_threat else (lead_anomaly["distance_m"] if lead_anomaly else 999.0),
-            "hazard_ttc_s": lead_threat["ttc_s"] if lead_threat else None,
-            "nominal_path_safe": center_cand.get("is_feasible", True) if center_cand else True,
-            "evaluated_candidates": len(self.planner.last_candidates_summary),
-            "selected_offset_m": chosen_cand.get("offset", 0.0) if chosen_cand else 0.0,
+            "has_hazard": has_threat or lead_anomaly is not None or (lead_pred is not None and lead_pred["corridor_invasion_pct"] >= 20),
+            "hazard_id": lead_threat["id"] if lead_threat else (f"ANOMALY_{lead_anomaly['id']}" if lead_anomaly else (lead_pred["id"] if lead_pred else "CLEAR")),
+            "hazard_dist_m": lead_threat["distance_m"] if lead_threat else (lead_anomaly["distance_m"] if lead_anomaly else (lead_pred["time_to_conflict_s"] or 0.0)),
+            "hazard_ttc_s": lead_threat["ttc_s"] if lead_threat else (lead_pred["time_to_conflict_s"] if lead_pred else None),
+            "nominal_path_safe": not has_threat and lead_anomaly is None and (lead_pred is None or lead_pred["corridor_invasion_pct"] < 20),
             "selected_mode": planned_traj.behavior_mode.value,
+            "selected_offset_m": selected_offset,
+            "steer_command_deg": round(math.degrees(cmd.steering_angle_rad), 1),
             "safety_action": safe_traj.safety_action.value,
-            "steer_command_deg": round(math.degrees(cmd.steering_angle_rad), 2),
-            "action_summary": action_text
+            "prediction_summary": lead_pred["explanation"] if lead_pred else ""
         }
 
+        # Pack full telemetry payload
         self.latest_telemetry = {
             "timestamp": round(state.timestamp, 2),
             "step": self.step_count,
             "vehicle_id": "SIH26037-AV-01",
-            "difficulty": self.difficulty.value,
+            "difficulty": self.difficulty.name,
             "perception": {
                 "mode": self.perception_pipeline.mode.value,
-                "active_tracks_count": len(obstacles),
+                "active_tracks_count": len(actors_data),
                 "sensor_health": perception_frame.sensor_health
             },
             "ego": {
                 "x": round(state.pose.position.x, 2),
                 "y": round(state.pose.position.y, 2),
-                "heading_deg": round(math.degrees(state.pose.heading_rad), 2),
+                "heading_deg": round(math.degrees(state.pose.heading_rad), 1),
                 "speed_mps": round(state.twist.speed_mps, 2),
                 "speed_kph": round(state.twist.speed_mps * 3.6, 1),
-                "steer_deg": round(math.degrees(state.steer_angle_rad), 1),
+                "steer_deg": round(math.degrees(cmd.steering_angle_rad), 1),
                 "throttle_pct": round(cmd.throttle_pct, 1),
                 "brake_pct": round(cmd.brake_pct, 1),
-                "battery_soc": round(state.battery_soc_pct, 1),
-                "length_m": 4.5,
-                "width_m": 1.8,
-                "safety_buffer_lat_m": 0.6,
-                "safety_buffer_lon_m": 1.2
+                "battery_soc": 95.0,
+                "length_m": 4.2,
+                "width_m": 1.8
+            },
+            "road": {
+                "s": round(s_post, 2),
+                "d": round(d_post, 2),
+                "current_width_m": round(curr_width, 2),
+                "left_edge_d_m": round(d_left, 2),
+                "right_edge_d_m": round(d_right, 2),
+                "current_margin_m": round(margin, 2),
+                "min_corridor_margin_m": round(self.min_corridor_margin, 2),
+                "is_ditch_breach": margin < 0.0,
+                "status": "CHOKE_POINT" if curr_width < 3.8 else ("PASSING_BAY" if curr_width > 5.0 else "NOMINAL"),
+                "polyline": road_polyline
             },
             "goal": {
                 "x": round(gx, 2),
                 "y": round(gy, 2),
-                "s": round(s_goal, 1),
-                "heading_deg": round(math.degrees(goal_yaw), 1),
+                "yaw_deg": round(math.degrees(goal_yaw), 1),
                 "distance_ahead_m": round(s_goal - s_curr, 1)
             },
-            "road": {
-                "s_curr": round(s_curr, 2),
-                "corridor_left_m": round(d_left, 2),
-                "corridor_right_m": round(d_right, 2),
-                "current_width_m": round(curr_width, 2),
-                "status": road_status_tag,
-                "current_margin_m": round(margin, 2),
-                "min_margin_m": round(self.min_corridor_margin, 2),
-                "polyline": road_polyline
-            },
-            "safety": {
-                "safety_action": safe_traj.safety_action.value,
-                "safety_status_reason": safe_traj.safety_status_reason,
-                "min_ttc_s": round(safe_traj.min_ttc_seconds, 2) if safe_traj.min_ttc_seconds < 100.0 else None,
-                "barrier_margin_m": round(safe_traj.barrier_margin_m, 2),
-                "is_emergency_stop": safe_traj.is_emergency_stop,
-                "replan_recommended": safe_traj.replan_recommended
-            },
-            "planning": {
-                "behavior_mode": planned_traj.behavior_mode.value,
-                "target_speed_kph": round(planned_traj.target_speed_mps * 3.6, 1),
-                "trajectory_id": planned_traj.trajectory_id
-            },
-            "candidates": self.planner.last_candidates_summary,
+            "actors": actors_data,
+            "anomalies": anomalies_data,
+            "predictions": predictions_data,
+            "candidates": [
+                {
+                    "offset": round(c.get("offset_m", 0.0), 2),
+                    "cost": 9999.0 if (math.isinf(c.get("cost", 0.0)) or c.get("cost") is None) else round(c.get("cost", 999.0), 2),
+                    "is_feasible": c.get("status") == "FEASIBLE",
+                    "is_selected": (c.get("mode") == planned_traj.behavior_mode.value and c.get("status") == "FEASIBLE"),
+                    "rejection_reason": c.get("reason", "CLEAR"),
+                    "waypoints": [
+                        {
+                            "x": wp["x"],
+                            "y": wp["y"]
+                        }
+                        for wp in c.get("sample_pts", [])
+                    ]
+                }
+                for c in self.planner.last_candidates_summary
+            ],
             "collision_zones": collision_zones,
             "causal_event": causal_event,
-            "anomalies": anomalies_data,
+            "trajectory": {
+                "id": safe_traj.source_trajectory_id,
+                "mode": planned_traj.behavior_mode.value,
+                "safety_action": safe_traj.safety_action.value,
+                "total_cost": round(planned_traj.total_cost, 2),
+                "waypoints": [
+                    {
+                        "x": round(wp.x, 2),
+                        "y": round(wp.y, 2),
+                        "yaw_deg": round(math.degrees(wp.yaw_rad), 1),
+                        "speed_mps": round(wp.speed_mps, 2)
+                    }
+                    for wp in safe_traj.waypoints
+                ]
+            },
             "status": {
                 "is_running": self.is_running,
-                "is_e_stop": self.is_emergency_stop,
-                "target_speed_kph": round(self.target_speed_mps * 3.6, 1)
-            },
-            "actors": actors_data,
-            "predictions": predictions_data,
-            "high_risk_agent_ids": pred_out.high_risk_agent_ids
+                "is_emergency_stop": self.is_emergency_stop,
+                "is_completed": self.is_completed
+            }
         }
 
-sim_engine = SimulationEngineState()
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="SIH26037 Autonomous Mobility Stack", version="0.1.0")
-
-    @app.on_event("startup")
-    async def start_sim_loop():
-        async def background_loop():
-            while True:
-                sim_engine.step()
-                await asyncio.sleep(0.05) # 20 Hz
-        asyncio.create_task(background_loop())
+def create_app(sim_engine: SimulationEngineState) -> FastAPI:
+    app = FastAPI(title="SIH26037 Autonomous Driving System")
 
     @app.get("/health")
     async def health():
         return {
-            "status": "UP",
-            "service": "SIH26037 Autonomous Mobility Service",
+            "status": "HEALTHY",
             "vehicle_id": "SIH26037-AV-01",
-            "scene": "Unmarked Indian Village Road (Neural IDD Perception)",
-            "difficulty": sim_engine.difficulty.value,
             "perception_mode": sim_engine.perception_pipeline.mode.value,
-            "e_stop": sim_engine.is_emergency_stop,
-            "is_running": sim_engine.is_running
+            "predictor_mode": sim_engine.predictor.mode
         }
 
     @app.get("/telemetry")
     async def get_telemetry():
-        return sim_engine.latest_telemetry
-
-    @app.post("/emergency_stop")
-    async def trigger_emergency_stop():
-        sim_engine.is_emergency_stop = True
-        return {"status": "EMERGENCY_STOP_TRIGGERED", "e_stop": True}
+        return JSONResponse(content=sim_engine.latest_telemetry)
 
     @app.post("/simulation/toggle")
     async def toggle_simulation():
         sim_engine.is_running = not sim_engine.is_running
-        return {"is_running": sim_engine.is_running}
+        return {"status": "TOGGLED", "is_running": sim_engine.is_running}
 
     @app.post("/simulation/reset")
     async def reset_simulation():
         sim_engine.reset()
-        return {"status": "RESET_SUCCESSFUL"}
+        return {"status": "RESET"}
+
+    @app.post("/simulation/emergency_stop")
+    async def trigger_emergency_stop():
+        sim_engine.is_emergency_stop = True
+        return {"status": "EMERGENCY_STOP_TRIGGERED"}
 
     @app.post("/simulation/spawn_hazard")
     async def spawn_hazard_api(req: HazardSpawnRequest):
         sim_engine.spawn_hazard(req.hazard_type, req.distance_ahead_m)
-        return {"status": "HAZARD_SPAWNED", "type": req.hazard_type}
+        sim_engine.step()
+        sim_engine.step()
+        return {"status": "HAZARD_SPAWNED", "hazard_type": req.hazard_type}
 
     @app.post("/simulation/difficulty")
     async def set_difficulty_api(req: DifficultyRequest):
         sim_engine.set_difficulty(req.difficulty)
-        return {"status": "DIFFICULTY_SET", "difficulty": sim_engine.difficulty.value}
+        return {"status": "DIFFICULTY_UPDATED", "difficulty": sim_engine.difficulty.name}
 
     @app.post("/simulation/perception_mode")
     async def set_perception_mode_api(req: PerceptionModeRequest):
@@ -507,6 +517,7 @@ def create_app() -> FastAPI:
         await websocket.accept()
         try:
             while True:
+                sim_engine.step()
                 await websocket.send_json(sim_engine.latest_telemetry)
                 await asyncio.sleep(0.05)
         except WebSocketDisconnect:
@@ -519,7 +530,7 @@ def create_app() -> FastAPI:
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SIH26037 — Real IDD Perception & Autonomous Motion Visualizer</title>
+    <title>SIH26037 — Probabilistic Motion Prediction & IDD Perception</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { background-color: #070b13; color: #e2e8f0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
@@ -535,14 +546,14 @@ def create_app() -> FastAPI:
         <div>
             <div class="inline-flex items-center gap-2 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 mb-1">
                 <span class="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></span>
-                SIH26037 • REAL IDD PERCEPTION & KALMAN TRACKER
+                SIH26037 • PROBABILISTIC MOTION PREDICTION & IDD PERCEPTION
             </div>
             <h1 class="text-xl md:text-2xl font-black tracking-tight text-white flex items-center gap-3">
-                Indian-Trained Perception Stack & Autonomous Planning
+                Adaptive Planning & Multi-Modal Trajectory Forecasting
                 <span id="badge-difficulty" class="text-xs px-2.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/40 font-mono font-bold">HARD TIER</span>
             </h1>
             <p class="text-xs text-slate-400 mt-0.5">
-                Sense-to-Control Pipeline: Camera Frame → IDD Object Detection → 3D Bounding Box → Persistent MOT Track ID → Kalman Velocity Filter → FreeSpace Corridor → Candidate Splines.
+                Sense → Track → Forecast Multi-Modal Branches (Continuation 60%, Cut-In 25%, Nudge 15%) → Dynamic Corridor Collision Check → DBW Actuation.
             </p>
         </div>
 
@@ -583,7 +594,7 @@ def create_app() -> FastAPI:
         <div class="flex items-center justify-between">
             <span class="text-xs font-bold uppercase tracking-wider text-cyan-400 flex items-center gap-2">
                 <span class="w-2 h-2 rounded-full bg-cyan-400 animate-ping"></span>
-                End-to-End Perception & Causal Decision Chain
+                End-to-End Perception, Multi-Modal Prediction & Causal Decision Chain
             </span>
             <span id="causal-summary-badge" class="text-xs font-mono font-bold px-3 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-500/40">
                 PERCEPTION ACTIVE — CRUISING
@@ -598,9 +609,9 @@ def create_app() -> FastAPI:
                 <span id="hud-hazard-dist" class="text-[10px] text-slate-500">Track ID: --</span>
             </div>
             <div id="step-2" class="chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800">
-                <span class="text-[10px] text-slate-500 font-sans block uppercase">2. Kalman Velocity & TTC</span>
-                <span id="hud-ttc" class="font-bold text-slate-300 block">TTC > 4.0s (Safe)</span>
-                <span id="hud-risk" class="text-[10px] text-slate-500">Nominal: VALID</span>
+                <span class="text-[10px] text-slate-500 font-sans block uppercase">2. Motion Prediction</span>
+                <span id="hud-ttc" class="font-bold text-slate-300 block">Forecast: Clear</span>
+                <span id="hud-risk" class="text-[10px] text-slate-500">Corridor Risk: <5%</span>
             </div>
             <div id="step-3" class="chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800">
                 <span class="text-[10px] text-slate-500 font-sans block uppercase">3. Candidate Bundle</span>
@@ -620,7 +631,7 @@ def create_app() -> FastAPI:
         </div>
     </div>
 
-    <!-- Main BEV Canvas Visualizer & Threat Feed -->
+    <!-- Main BEV Canvas Visualizer & Prediction Feed -->
     <div class="grid grid-cols-1 lg:grid-cols-4 gap-4">
         <!-- Main Canvas Area -->
         <div class="lg:col-span-3 glass-card p-4 space-y-3">
@@ -639,13 +650,19 @@ def create_app() -> FastAPI:
                 </div>
 
                 <!-- Interactive Hazard Injection Bar -->
-                <div class="flex items-center gap-1.5">
+                <div class="flex items-center gap-1.5 flex-wrap">
                     <span class="text-[11px] text-slate-400 font-bold">Inject:</span>
+                    <button onclick="spawnHazard('motorcycle')" class="px-2.5 py-1 rounded bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-300 border border-cyan-500/40 text-[11px] font-bold transition">
+                        🏍️ Motorcycle
+                    </button>
                     <button onclick="spawnHazard('tractor')" class="px-2.5 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-[11px] font-bold transition">
                         🚜 Tractor
                     </button>
                     <button onclick="spawnHazard('pedestrian')" class="px-2.5 py-1 rounded bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 text-[11px] font-bold transition">
                         🚶 Villager
+                    </button>
+                    <button onclick="spawnHazard('cattle')" class="px-2.5 py-1 rounded bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-300 border border-yellow-500/40 text-[11px] font-bold transition">
+                        🐄 Cattle
                     </button>
                     <button onclick="spawnHazard('auto')" class="px-2.5 py-1 rounded bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 border border-orange-500/40 text-[11px] font-bold transition">
                         🛺 Auto
@@ -664,17 +681,17 @@ def create_app() -> FastAPI:
             <!-- Visual Legend & Explanation Bar -->
             <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 text-[10px] text-slate-300 pt-2 border-t border-slate-800/80">
                 <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-emerald-400 shadow-sm shadow-emerald-400"></span> Selected Path</div>
-                <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-cyan-400/40 border border-cyan-400"></span> Candidate Fan (7)</div>
-                <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-rose-500"></span> Ditch/Collision Limit</div>
+                <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-cyan-400/40 border border-cyan-400"></span> Candidates (7)</div>
+                <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-amber-400 border border-amber-400"></span> Forecast 60%</div>
+                <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-rose-500 border border-rose-500"></span> Cut-In 25% ⚠️</div>
                 <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-red-950 border border-red-500"></span> Potholes & Craters</div>
                 <div class="flex items-center gap-1.5"><span class="w-3 h-1 bg-yellow-400"></span> Speed Bumps</div>
-                <div class="flex items-center gap-1.5"><span class="w-3 h-1 rounded bg-orange-500/40 border border-orange-500"></span> Gravel Shoulder</div>
-                <div class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-amber-400"></span> Velocity Vector (→)</div>
+                <div class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-amber-400"></span> Velocity (→)</div>
                 <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full border border-yellow-400 text-yellow-400 font-mono text-[9px] flex items-center justify-center">🎯</span> Goal Horizon</div>
             </div>
         </div>
 
-        <!-- Right Side: Threat Radar & Live KPIs -->
+        <!-- Right Side: Probabilistic Predictions & Live Telemetry -->
         <div class="glass-card p-4 space-y-4">
             <!-- Telemetry Cards -->
             <div class="grid grid-cols-2 gap-2">
@@ -689,9 +706,9 @@ def create_app() -> FastAPI:
                     <span class="text-[9px] text-slate-500 font-semibold">Front Wheel</span>
                 </div>
                 <div class="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
-                    <span class="text-[10px] text-slate-400 font-bold uppercase block">Perception Tracks</span>
+                    <span class="text-[10px] text-slate-400 font-bold uppercase block">Predicted Agents</span>
                     <span id="kpi-tracks" class="text-xl font-black text-cyan-300 font-mono">0</span>
-                    <span class="text-[9px] text-slate-500 font-semibold">Persistent MOT</span>
+                    <span class="text-[9px] text-slate-500 font-semibold">Multi-Modal</span>
                 </div>
                 <div class="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
                     <span class="text-[10px] text-slate-400 font-bold uppercase block">Ditch Margin</span>
@@ -700,17 +717,17 @@ def create_app() -> FastAPI:
                 </div>
             </div>
 
-            <!-- Threat Radar Feed with Persistent Tracks -->
+            <!-- Probabilistic Motion Prediction Panel -->
             <div class="space-y-2">
                 <div class="flex items-center justify-between border-t border-slate-800 pt-2">
-                    <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300">
-                        IDD Perception & Track States
+                    <h3 class="text-xs font-bold uppercase tracking-wider text-cyan-300 flex items-center gap-1.5">
+                        <span>🧠</span> Motion Prediction (IDD)
                     </h3>
-                    <span class="text-[10px] text-cyan-400 font-mono">20 Hz Sense</span>
+                    <span class="text-[10px] text-cyan-400 font-mono">Multi-Modal K=3</span>
                 </div>
                 
-                <div id="actors-list" class="space-y-2 text-xs max-h-40 overflow-y-auto pr-1">
-                    <!-- Dynamically populated -->
+                <div id="predictions-list" class="space-y-2 text-xs max-h-56 overflow-y-auto pr-1">
+                    <!-- Dynamically populated with multi-modal forecast cards -->
                 </div>
             </div>
 
@@ -719,7 +736,7 @@ def create_app() -> FastAPI:
                 <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300 pt-2 border-t border-slate-800">
                     Perceived Road Anomalies
                 </h3>
-                <div id="anomalies-list" class="space-y-1 text-[11px] font-mono max-h-32 overflow-y-auto pr-1">
+                <div id="anomalies-list" class="space-y-1 text-[11px] font-mono max-h-24 overflow-y-auto pr-1">
                     <!-- Populated with potholes / humps -->
                 </div>
             </div>
@@ -729,7 +746,7 @@ def create_app() -> FastAPI:
                 <h3 class="text-xs font-bold uppercase tracking-wider text-slate-300 pt-2 border-t border-slate-800">
                     7 Candidate Splines Evaluated
                 </h3>
-                <div id="candidates-list" class="space-y-1 text-[11px] font-mono max-h-36 overflow-y-auto pr-1">
+                <div id="candidates-list" class="space-y-1 text-[11px] font-mono max-h-28 overflow-y-auto pr-1">
                     <!-- Populated with all 7 offset evaluations -->
                 </div>
             </div>
@@ -768,7 +785,7 @@ def create_app() -> FastAPI:
             if (!data || !data.ego) return;
             document.getElementById('kpi-speed').innerText = data.ego.speed_kph;
             document.getElementById('kpi-steer').innerText = `${data.ego.steer_deg}°`;
-            document.getElementById('kpi-tracks').innerText = (data.actors || []).length;
+            document.getElementById('kpi-tracks').innerText = (data.predictions || []).length;
             document.getElementById('kpi-margin').innerText = `${data.road.current_margin_m} m`;
 
             const widthBadge = document.getElementById('road-width-badge');
@@ -809,8 +826,8 @@ def create_app() -> FastAPI:
                 document.getElementById('hud-hazard-dist').innerText = `Range: ${ce.hazard_dist_m}m`;
 
                 s2.className = 'chain-step p-2 rounded-lg bg-rose-950/40 border border-rose-500/60';
-                document.getElementById('hud-ttc').innerHTML = `<span class="text-rose-400 font-bold">TTC: ${ce.hazard_ttc_s || '<1.0'}s</span>`;
-                document.getElementById('hud-risk').innerHTML = ce.nominal_path_safe ? '<span class="text-slate-400">Nominal: CLEAR</span>' : '<span class="text-rose-400 font-bold">Nominal: UNSAFE (Blocked)</span>';
+                document.getElementById('hud-ttc').innerHTML = `<span class="text-rose-400 font-bold">${ce.prediction_summary || 'Cut-in Risk Detected'}</span>`;
+                document.getElementById('hud-risk').innerHTML = ce.nominal_path_safe ? '<span class="text-slate-400">Path: CLEAR</span>' : '<span class="text-rose-400 font-bold">Path: CONFLICT DETECTED</span>';
 
                 s3.className = 'chain-step p-2 rounded-lg bg-cyan-950/40 border border-cyan-500/60';
                 document.getElementById('hud-candidates').innerText = `7 Candidates Evaluated`;
@@ -825,13 +842,13 @@ def create_app() -> FastAPI:
                 document.getElementById('hud-speed-act').innerText = `Speed: ${data.ego.speed_kph} km/h`;
 
                 document.getElementById('causal-summary-badge').className = 'text-xs font-mono font-bold px-3 py-0.5 rounded bg-rose-950 text-rose-300 border border-rose-500/60 animate-pulse';
-                document.getElementById('causal-summary-badge').innerText = `AVOIDING: ${ce.hazard_id.toUpperCase()} (${ce.selected_mode})`;
+                document.getElementById('causal-summary-badge').innerText = `PROACTIVE AVOIDANCE: ${ce.hazard_id.toUpperCase()} (${ce.selected_mode})`;
             } else {
                 [s1, s2, s3, s4, s5].forEach(el => el.className = 'chain-step p-2 rounded-lg bg-slate-900/90 border border-slate-800');
                 document.getElementById('hud-hazard').innerText = 'None Detected';
                 document.getElementById('hud-hazard-dist').innerText = 'Track ID: Clear';
-                document.getElementById('hud-ttc').innerText = 'TTC > 4.0s (Safe)';
-                document.getElementById('hud-risk').innerText = 'Nominal: VALID';
+                document.getElementById('hud-ttc').innerText = 'Forecast: Clear';
+                document.getElementById('hud-risk').innerText = 'Corridor Risk: <5%';
                 document.getElementById('hud-candidates').innerText = '7 Evaluated';
                 document.getElementById('hud-cand-status').innerText = 'Center (0.0m) Clear';
                 document.getElementById('hud-mode').innerText = 'CRUISE';
@@ -843,29 +860,62 @@ def create_app() -> FastAPI:
                 document.getElementById('causal-summary-badge').innerText = 'PERCEPTION ACTIVE — CRUISING';
             }
 
-            // Update Actors List with Persistent Track IDs & Confidence
-            const listEl = document.getElementById('actors-list');
-            listEl.innerHTML = '';
-            (data.actors || []).forEach(a => {
+            // Update Probabilistic Motion Prediction List
+            const predList = document.getElementById('predictions-list');
+            predList.innerHTML = '';
+            (data.predictions || []).forEach(p => {
                 const item = document.createElement('div');
-                item.className = 'p-2 rounded-lg bg-slate-900 border border-slate-800 space-y-1';
-                const aheadText = a.x_ego >= 0 ? `+${a.x_ego}m ahead` : `${a.x_ego}m behind`;
-                const latText = a.y_ego >= 0 ? `+${a.y_ego}m L` : `${a.y_ego}m R`;
-                const ttcBadge = a.ttc_s ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${a.ttc_s < 2.0 ? 'bg-rose-900/80 text-rose-300 animate-pulse' : 'bg-amber-900/40 text-amber-300'}">TTC: ${a.ttc_s}s</span>` : '';
-                item.innerHTML = `
-                    <div class="flex items-center justify-between font-semibold">
-                        <span class="text-slate-200 font-mono">${a.id}</span>
-                        <div class="flex items-center gap-1">
-                            ${ttcBadge}
-                            <span class="text-[10px] px-1.5 py-0.2 rounded bg-cyan-900/60 text-cyan-300 font-mono">${Math.round((a.confidence || 0.95)*100)}% ${a.class}</span>
+                const isHigh = p.is_high_risk || p.corridor_invasion_pct >= 25;
+                item.className = `p-2.5 rounded-lg border ${isHigh ? 'bg-rose-950/40 border-rose-500/60 shadow-md' : 'bg-slate-900 border-slate-800'} space-y-2`;
+                
+                const iconMap = {
+                    'MOTORCYCLE': '🏍️',
+                    'TRUCK': '🚜',
+                    'AUTO_RICKSHAW': '🛺',
+                    'PEDESTRIAN': '🚶',
+                    'CATTLE_ANIMAL': '🐄',
+                    'BUS': '🚌',
+                    'CAR': '🚗'
+                };
+                const icon = iconMap[p.class] || '🚗';
+
+                // Format multi-modal probability badges
+                let modePillsHtml = '';
+                (p.trajectories || []).forEach(t => {
+                    const isCutIn = t.mode_name.includes('cut_in') || t.mode_name.includes('crossing');
+                    const badgeColor = isCutIn ? (t.probability_pct >= 25 ? 'bg-rose-900/80 text-rose-200 border-rose-600 font-bold' : 'bg-amber-900/50 text-amber-200 border-amber-600') : 'bg-slate-800 text-slate-300 border-slate-700';
+                    const modeLabel = t.mode_name.replace(/_/g, ' ');
+                    modePillsHtml += `
+                        <div class="flex items-center justify-between text-[10px] px-2 py-0.5 rounded ${badgeColor} border font-mono">
+                            <span class="capitalize">${modeLabel}</span>
+                            <span class="font-bold">${t.probability_pct}%</span>
                         </div>
+                    `;
+                });
+
+                const riskBadge = p.corridor_invasion_pct > 0 
+                    ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold ${p.corridor_invasion_pct >= 25 ? 'bg-rose-900 text-rose-200 animate-pulse' : 'bg-amber-900 text-amber-200'} font-mono">${p.corridor_invasion_pct}% Cut-in Risk</span>`
+                    : `<span class="px-2 py-0.5 rounded text-[10px] bg-emerald-950 text-emerald-300 font-mono">Path Clear</span>`;
+
+                item.innerHTML = `
+                    <div class="flex items-center justify-between">
+                        <div class="flex items-center gap-1.5 font-bold text-slate-200">
+                            <span>${icon}</span>
+                            <span class="font-mono text-xs">${p.id}</span>
+                            <span class="text-[9px] px-1.5 py-0.2 rounded bg-cyan-950 text-cyan-300 border border-cyan-800 font-mono">${p.intent}</span>
+                        </div>
+                        ${riskBadge}
                     </div>
-                    <div class="flex justify-between text-[10px] text-slate-400 font-mono">
-                        <span>Range: <b class="text-slate-200">${a.distance_m}m</b> (${aheadText}, ${latText})</span>
-                        <span>Vel: <b class="text-amber-300">${a.speed_mps}m/s</b></span>
+
+                    <div class="space-y-1">
+                        ${modePillsHtml}
+                    </div>
+
+                    <div class="text-[10px] text-slate-300 font-sans italic bg-slate-950/60 p-1.5 rounded border border-slate-800/80">
+                        💬 "${p.explanation}"
                     </div>
                 `;
-                listEl.appendChild(item);
+                predList.appendChild(item);
             });
 
             // Update Anomalies List
@@ -1166,7 +1216,7 @@ def create_app() -> FastAPI:
                 }
             });
 
-            // 6. Collision & Ditch Breach Zones
+            // 6. Collision & Predicted Conflict Zones
             (data.collision_zones || []).forEach(cz => {
                 const scr = worldToScreen(cz.x, cz.y);
                 const rPix = cz.radius_m * scale;
@@ -1191,7 +1241,7 @@ def create_app() -> FastAPI:
                 ctx.fillText(`💥 ${cz.obstacle_id}`, scr.sx + rPix + 3, scr.sy + 3);
             });
 
-            // 7. Multi-Modal Motion Predictions of Obstacles
+            // 7. Multi-Modal Motion Predictions of Perceived Actors (60% / 25% / 15%)
             (data.predictions || []).forEach(pred => {
                 (pred.trajectories || []).forEach(tr => {
                     if (tr.waypoints && tr.waypoints.length > 0) {
@@ -1203,29 +1253,49 @@ def create_app() -> FastAPI:
                             ctx.lineTo(scr.sx, scr.sy);
                         });
 
-                        ctx.strokeStyle = tr.collision_risk > 0.4 ? 'rgba(244, 63, 94, 0.85)' : 'rgba(245, 158, 11, 0.55)';
-                        ctx.lineWidth = tr.collision_risk > 0.4 ? 2.5 : 1.5;
-                        ctx.setLineDash([3, 3]);
+                        const isCutIn = tr.mode_name.includes('cut_in') || tr.mode_name.includes('crossing');
+                        const isMain = tr.probability >= 0.50;
+
+                        if (isCutIn && tr.probability >= 0.20) {
+                            ctx.strokeStyle = 'rgba(244, 63, 94, 0.95)';
+                            ctx.lineWidth = 2.5;
+                            ctx.setLineDash([4, 2]);
+                        } else if (isMain) {
+                            ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
+                            ctx.lineWidth = 2.2;
+                            ctx.setLineDash([]);
+                        } else {
+                            ctx.strokeStyle = 'rgba(148, 163, 184, 0.50)';
+                            ctx.lineWidth = 1.4;
+                            ctx.setLineDash([3, 3]);
+                        }
                         ctx.stroke();
                         ctx.setLineDash([]);
 
-                        tr.waypoints.forEach(wp => {
-                            if (Math.abs(wp.time_offset_s - 1.0) < 0.15 || Math.abs(wp.time_offset_s - 2.0) < 0.15 || Math.abs(wp.time_offset_s - 3.0) < 0.15) {
-                                const scr = worldToScreen(wp.x, wp.y);
-                                ctx.fillStyle = tr.collision_risk > 0.4 ? '#f43f5e' : '#fbbf24';
+                        // Draw Uncertainty Ellipses & Waypoint Indicators
+                        tr.waypoints.forEach((wp, idx) => {
+                            const scr = worldToScreen(wp.x, wp.y);
+                            if (idx === tr.waypoints.length - 1 || idx === Math.floor(tr.waypoints.length / 2)) {
+                                // Spatial covariance uncertainty ellipse
+                                ctx.strokeStyle = isCutIn ? 'rgba(244, 63, 94, 0.35)' : 'rgba(245, 158, 11, 0.25)';
+                                ctx.lineWidth = 1.0;
                                 ctx.beginPath();
-                                ctx.arc(scr.sx, scr.sy, 3, 0, Math.PI * 2);
-                                ctx.fill();
+                                ctx.ellipse(scr.sx, scr.sy, (wp.sigma_y || 0.3) * scale, (wp.sigma_x || 0.3) * scale, 0, 0, Math.PI * 2);
+                                ctx.stroke();
 
-                                ctx.font = '8px monospace';
-                                ctx.fillText(`+${wp.time_offset_s}s`, scr.sx + 5, scr.sy + 3);
+                                // Probability Badge along Branch Head
+                                if (idx === tr.waypoints.length - 1) {
+                                    ctx.fillStyle = isCutIn ? '#fca5a5' : (isMain ? '#fde047' : '#94a3b8');
+                                    ctx.font = 'bold 9px monospace';
+                                    ctx.fillText(`→ ${tr.probability_pct}%`, scr.sx + 6, scr.sy + 3);
+                                }
                             }
                         });
                     }
                 });
             });
 
-            // 8. Obstacles with IDD Track Labels & Velocity Vectors
+            // 8. Perceived Actors with 3D Bounding Boxes & Direction Arrows
             (data.actors || []).forEach(a => {
                 const scr = worldToScreen(a.x_world, a.y_world);
                 const relHeading = ((a.yaw_deg || 0) - ego.heading_deg) * Math.PI / 180;
@@ -1237,16 +1307,18 @@ def create_app() -> FastAPI:
                 const lengthPix = a.length_m * scale;
                 const widthPix = a.width_m * scale;
 
-                if (a.class === 'TRUCK' || a.id.includes('tractor')) {
+                if (a.class === 'MOTORCYCLE' || a.id.includes('motorcycle') || a.id.includes('bike')) {
+                    ctx.fillStyle = '#06b6d4';
+                    ctx.fillRect(-widthPix/2, -lengthPix/2, widthPix, lengthPix);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = 'bold 9px sans-serif';
+                    ctx.fillText('🏍️ MOTO', -widthPix/2 + 2, 2);
+                } else if (a.class === 'TRUCK' || a.id.includes('tractor')) {
                     ctx.fillStyle = '#f59e0b';
                     ctx.fillRect(-widthPix/2, -lengthPix/2, widthPix, lengthPix);
                     ctx.fillStyle = '#0f172a';
                     ctx.fillRect(-widthPix/2 - 4, -lengthPix/2 + 2, 4, lengthPix * 0.4);
                     ctx.fillRect(widthPix/2, -lengthPix/2 + 2, 4, lengthPix * 0.4);
-                    ctx.fillRect(-widthPix/2 - 2, lengthPix/2 - lengthPix * 0.35, 3, lengthPix * 0.3);
-                    ctx.fillRect(widthPix/2 - 1, lengthPix/2 - lengthPix * 0.35, 3, lengthPix * 0.3);
-                    ctx.fillStyle = '#78350f';
-                    ctx.fillRect(-widthPix/3, -lengthPix/4, widthPix * 0.66, lengthPix * 0.4);
                     ctx.fillStyle = '#ffffff';
                     ctx.font = 'bold 9px sans-serif';
                     ctx.fillText('🚜 TRACTOR', -widthPix/2 + 2, 2);
@@ -1258,11 +1330,15 @@ def create_app() -> FastAPI:
                     ctx.fillStyle = '#ffffff';
                     ctx.font = 'bold 8px sans-serif';
                     ctx.fillText('🚶 PED', -10, -10);
+                } else if (a.class === 'CATTLE_ANIMAL' || a.id.includes('cattle') || a.id.includes('cow')) {
+                    ctx.fillStyle = '#eab308';
+                    ctx.fillRect(-widthPix/2, -lengthPix/2, widthPix, lengthPix);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.font = 'bold 8px sans-serif';
+                    ctx.fillText('🐄 CATTLE', -widthPix/2 + 2, 2);
                 } else if (a.class === 'AUTO_RICKSHAW' || a.id.includes('auto')) {
                     ctx.fillStyle = '#ea580c';
                     ctx.fillRect(-widthPix/2, -lengthPix/2, widthPix, lengthPix);
-                    ctx.fillStyle = '#fde047';
-                    ctx.fillRect(-widthPix/2, -lengthPix/2, widthPix, lengthPix * 0.3);
                     ctx.fillStyle = '#ffffff';
                     ctx.font = 'bold 8px sans-serif';
                     ctx.fillText('🛺 AUTO', -widthPix/2 + 3, 2);
@@ -1298,192 +1374,156 @@ def create_app() -> FastAPI:
                     ctx.font = 'bold 9px monospace';
                     ctx.fillText(`${a.speed_mps}m/s`, vEndSx + 5, vEndSy - 2);
                 }
-
-                ctx.fillStyle = '#e2e8f0';
-                ctx.font = 'bold 9px monospace';
-                const aheadTxt = a.x_ego >= 0 ? `+${a.x_ego}m` : `${a.x_ego}m`;
-                ctx.fillText(`${a.id} (${aheadTxt})`, scr.sx + 12, scr.sy + 10);
             });
 
-            // 9. Ego Vehicle & Dynamic Safety Envelope
-            const envLatPix = (ego.width_m/2 + ego.safety_buffer_lat_m) * scale;
-            const envLonPix = (ego.length_m/2 + ego.safety_buffer_lon_m) * scale;
-            const isDanger = data.safety.is_emergency_stop || (data.causal_event && data.causal_event.has_hazard && data.causal_event.hazard_ttc_s && data.causal_event.hazard_ttc_s < 2.0);
-            const isCaution = data.causal_event && data.causal_event.has_hazard;
+            // 9. Ego Autonomous Vehicle (Centered at origin)
+            const egoLenPix = ego.length_m * scale;
+            const egoWidPix = ego.width_m * scale;
 
-            ctx.strokeStyle = isDanger ? '#ef4444' : (isCaution ? '#f59e0b' : '#06b6d4');
-            ctx.fillStyle = isDanger ? 'rgba(239, 68, 68, 0.15)' : (isCaution ? 'rgba(245, 158, 11, 0.10)' : 'rgba(6, 182, 212, 0.08)');
-            ctx.lineWidth = 1.8;
+            // Safe Clearance Envelope
+            ctx.strokeStyle = 'rgba(16, 185, 129, 0.35)';
+            ctx.lineWidth = 1.5;
             ctx.setLineDash([4, 4]);
             ctx.beginPath();
-            ctx.roundRect(originX - envLatPix, originY - envLonPix, envLatPix * 2, envLonPix * 2, 8);
-            ctx.fill();
+            ctx.ellipse(originX, originY, egoWidPix * 0.9, egoLenPix * 0.75, 0, 0, Math.PI * 2);
             ctx.stroke();
             ctx.setLineDash([]);
 
-            const egoLPix = ego.length_m * scale;
-            const egoWPix = ego.width_m * scale;
-
-            // Headlights
-            const grad = ctx.createLinearGradient(originX, originY - egoLPix/2, originX, originY - egoLPix/2 - 40);
-            grad.addColorStop(0, 'rgba(254, 240, 138, 0.4)');
-            grad.addColorStop(1, 'rgba(254, 240, 138, 0.0)');
-            ctx.fillStyle = grad;
+            // Ego Vehicle Body
+            ctx.fillStyle = '#0284c7';
             ctx.beginPath();
-            ctx.moveTo(originX - egoWPix/2 + 2, originY - egoLPix/2);
-            ctx.lineTo(originX - egoWPix/2 - 15, originY - egoLPix/2 - 45);
-            ctx.lineTo(originX + egoWPix/2 + 15, originY - egoLPix/2 - 45);
-            ctx.lineTo(originX + egoWPix/2 - 2, originY - egoLPix/2);
+            ctx.roundRect(originX - egoWidPix/2, originY - egoLenPix/2, egoWidPix, egoLenPix, 6);
+            ctx.fill();
+
+            // Windshield & Roof
+            ctx.fillStyle = '#0369a1';
+            ctx.beginPath();
+            ctx.roundRect(originX - egoWidPix*0.35, originY - egoLenPix*0.35, egoWidPix*0.7, egoLenPix*0.45, 4);
+            ctx.fill();
+
+            // Headlights Beam
+            ctx.fillStyle = 'rgba(56, 189, 248, 0.15)';
+            ctx.beginPath();
+            ctx.moveTo(originX - egoWidPix * 0.4, originY - egoLenPix/2);
+            ctx.lineTo(originX - egoWidPix * 1.5, originY - egoLenPix/2 - 50);
+            ctx.lineTo(originX + egoWidPix * 1.5, originY - egoLenPix/2 - 50);
+            ctx.lineTo(originX + egoWidPix * 0.4, originY - egoLenPix/2);
             ctx.closePath();
             ctx.fill();
 
-            // Car Body
-            ctx.fillStyle = '#06b6d4';
-            ctx.fillRect(originX - egoWPix/2, originY - egoLPix/2, egoWPix, egoLPix);
-            ctx.fillStyle = '#0891b2';
-            ctx.fillRect(originX - egoWPix/3, originY - egoLPix/4, egoWPix * 0.66, egoLPix * 0.5);
-
-            // Front Steered Wheels
-            const steerRad = -ego.steer_deg * Math.PI / 180;
-            ctx.fillStyle = '#0f172a';
-
-            ctx.save();
-            ctx.translate(originX - egoWPix/2 - 2, originY - egoLPix/3);
-            ctx.rotate(steerRad);
-            ctx.fillRect(-2, -5, 4, 10);
-            ctx.restore();
-
-            ctx.save();
-            ctx.translate(originX + egoWPix/2 + 2, originY - egoLPix/3);
-            ctx.rotate(steerRad);
-            ctx.fillRect(-2, -5, 4, 10);
-            ctx.restore();
-
-            ctx.fillRect(originX - egoWPix/2 - 3, originY + egoLPix/4, 4, 10);
-            ctx.fillRect(originX + egoWPix/2 - 1, originY + egoLPix/4, 4, 10);
-
             ctx.fillStyle = '#ffffff';
-            ctx.font = 'bold 9px sans-serif';
-            ctx.fillText('🚗 EGO AV', originX - 22, originY + 3);
+            ctx.font = 'bold 10px monospace';
+            ctx.fillText('🚗 EGO', originX - 16, originY + 4);
         }
 
         // ----------------------------------------------------
-        // VIEW 2: ROAD OVERVIEW (PANORAMIC HORIZONTAL)
+        // VIEW 2: ROAD OVERVIEW (PANORAMA)
         // ----------------------------------------------------
         function renderRoadOverview(data, w, h) {
-            const egoX = data.ego.x;
-            const egoY = data.ego.y;
-            const scale = 14;
-            const offsetX = 220 - egoX * scale;
-            const centerY = h / 2;
+            const ego = data.ego;
+            const scale = 3.5;
+            const originX = 60;
+            const originY = h / 2;
+
+            function worldToPanorama(wx, wy) {
+                const sx = originX + wx * scale;
+                const sy = originY - wy * scale * 2.5;
+                return { sx, sy };
+            }
 
             ctx.fillStyle = '#0a0f1d';
             ctx.fillRect(0, 0, w, h);
 
+            // Road Polyline
             const poly = data.road.polyline || [];
             if (poly.length > 2) {
-                ctx.fillStyle = '#1e293b';
+                ctx.fillStyle = '#161e2e';
                 ctx.beginPath();
-                poly.forEach((pt, i) => {
-                    const sx = pt.cx * scale + offsetX;
-                    const sy = centerY - pt.ly * scale;
-                    if (i === 0) ctx.moveTo(sx, sy);
-                    else ctx.lineTo(sx, sy);
+                let started = false;
+                poly.forEach(pt => {
+                    const scr = worldToPanorama(pt.lx, pt.ly);
+                    if (!started) { ctx.moveTo(scr.sx, scr.sy); started = true; }
+                    else { ctx.lineTo(scr.sx, scr.sy); }
                 });
                 for (let i = poly.length - 1; i >= 0; i--) {
-                    const sx = poly[i].cx * scale + offsetX;
-                    const sy = centerY - poly[i].ry * scale;
-                    ctx.lineTo(sx, sy);
+                    const scr = worldToPanorama(poly[i].rx, poly[i].ry);
+                    ctx.lineTo(scr.sx, scr.sy);
                 }
                 ctx.closePath();
                 ctx.fill();
 
+                // Edges
                 ctx.strokeStyle = '#eab308';
                 ctx.lineWidth = 2.0;
+                ctx.beginPath();
+                poly.forEach((pt, i) => {
+                    const scr = worldToPanorama(pt.lx, pt.ly);
+                    if (i === 0) ctx.moveTo(scr.sx, scr.sy); else ctx.lineTo(scr.sx, scr.sy);
+                });
+                ctx.stroke();
+
+                ctx.beginPath();
+                poly.forEach((pt, i) => {
+                    const scr = worldToPanorama(pt.rx, pt.ry);
+                    if (i === 0) ctx.moveTo(scr.sx, scr.sy); else ctx.lineTo(scr.sx, scr.sy);
+                });
                 ctx.stroke();
             }
 
-            (data.candidates || []).forEach(cand => {
-                if (!cand.waypoints || cand.waypoints.length === 0) return;
-                ctx.beginPath();
-                ctx.moveTo(egoX * scale + offsetX, centerY - egoY * scale);
-                cand.waypoints.forEach(wp => {
-                    ctx.lineTo(wp.x * scale + offsetX, centerY - wp.y * scale);
-                });
+            // Ego
+            const egoScr = worldToPanorama(ego.x, ego.y);
+            ctx.fillStyle = '#0284c7';
+            ctx.beginPath();
+            ctx.arc(egoScr.sx, egoScr.sy, 8, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 9px sans-serif';
+            ctx.fillText('🚗 EGO', egoScr.sx + 10, egoScr.sy + 3);
 
-                if (cand.is_selected) {
-                    ctx.strokeStyle = '#10b981';
-                    ctx.lineWidth = 3.5;
-                    ctx.stroke();
-                } else if (cand.is_feasible) {
-                    ctx.strokeStyle = 'rgba(6, 182, 212, 0.35)';
-                    ctx.lineWidth = 1.5;
-                    ctx.setLineDash([4, 4]);
-                    ctx.stroke();
-                    ctx.setLineDash([]);
-                } else {
-                    ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
-                    ctx.lineWidth = 1.5;
-                    ctx.setLineDash([2, 4]);
-                    ctx.stroke();
-                    ctx.setLineDash([]);
-                }
-            });
-
+            // Perceived Obstacles
             (data.actors || []).forEach(a => {
-                const ax = a.x_world * scale + offsetX;
-                const ay = centerY - a.y_world * scale;
-                ctx.fillStyle = a.class === 'TRUCK' ? '#f59e0b' : (a.class === 'PEDESTRIAN' ? '#f43f5e' : '#ea580c');
+                const scr = worldToPanorama(a.x_world, a.y_world);
+                ctx.fillStyle = a.class === 'MOTORCYCLE' ? '#06b6d4' : (a.class === 'TRUCK' ? '#f59e0b' : '#f43f5e');
                 ctx.beginPath();
-                ctx.arc(ax, ay, 9, 0, Math.PI * 2);
+                ctx.arc(scr.sx, scr.sy, 6, 0, Math.PI * 2);
                 ctx.fill();
                 ctx.fillStyle = '#ffffff';
                 ctx.font = 'bold 9px monospace';
-                ctx.fillText(a.id, ax - 12, ay - 12);
+                ctx.fillText(a.id, scr.sx + 8, scr.sy + 3);
             });
-
-            const ex = egoX * scale + offsetX;
-            const ey = centerY - egoY * scale;
-            ctx.fillStyle = '#06b6d4';
-            ctx.fillRect(ex - 22, ey - 10, 44, 20);
-            ctx.fillStyle = '#ffffff';
-            ctx.font = 'bold 9px sans-serif';
-            ctx.fillText('EGO', ex - 10, ey + 3);
         }
 
-        async function toggleSim() {
-            await fetch('/simulation/toggle', { method: 'POST' });
+        // ==========================================
+        // CONTROLS & API DISPATCH
+        // ==========================================
+        function toggleSim() {
+            fetch('/simulation/toggle', { method: 'POST' });
         }
-
-        async function resetSim() {
-            await fetch('/simulation/reset', { method: 'POST' });
+        function resetSim() {
+            fetch('/simulation/reset', { method: 'POST' });
         }
-
-        async function triggerEStop() {
-            await fetch('/emergency_stop', { method: 'POST' });
+        function triggerEStop() {
+            fetch('/simulation/emergency_stop', { method: 'POST' });
         }
-
-        async function spawnHazard(type) {
-            await fetch('/simulation/spawn_hazard', {
+        function changeDifficulty(diff) {
+            fetch('/simulation/difficulty', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ hazard_type: type, distance_ahead_m: 35.0 })
+                body: JSON.stringify({ difficulty: diff })
             });
         }
-
-        async function changeDifficulty(level) {
-            await fetch('/simulation/difficulty', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ difficulty: level })
-            });
-        }
-
-        async function changePerceptionMode(mode) {
-            await fetch('/simulation/perception_mode', {
+        function changePerceptionMode(mode) {
+            fetch('/simulation/perception_mode', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ mode: mode })
+            });
+        }
+        function spawnHazard(type) {
+            fetch('/simulation/spawn_hazard', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ hazard_type: type, distance_ahead_m: 30.0 })
             });
         }
     </script>
@@ -1493,7 +1533,9 @@ def create_app() -> FastAPI:
 
     return app
 
+
+app = create_app(SimulationEngineState(difficulty=DifficultyLevel.HARD))
+
 if __name__ == "__main__":
     import uvicorn
-    app = create_app()
-    uvicorn.run(app, host="0.0.0.0", port=5002)
+    uvicorn.run(app, host="127.0.0.1", port=5002, log_level="warning")
