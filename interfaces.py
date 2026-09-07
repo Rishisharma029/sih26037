@@ -173,14 +173,31 @@ class FreeSpaceCorridor(BaseModel):
     is_blocked: bool = Field(False, description="True if road is completely blocked")
 
 
+class TraversabilityClass(str, Enum):
+    """Road surface classification for unstructured Indian conditions."""
+    SAFE = "SAFE"
+    DEGRADED = "DEGRADED"
+    POTHOLE = "POTHOLE"
+    GRAVEL = "GRAVEL"
+    WATERLOGGED = "WATERLOGGED"
+    SPEED_BUMP = "SPEED_BUMP"
+    BLOCKED = "BLOCKED"
+
+
 class RoadAnomaly(BaseModel):
     """Potholes, unmarked speed humps, or broken road surfaces."""
     model_config = ConfigDict(extra="forbid")
     id: str
-    anomaly_type: str = Field(..., description="'POTHOLE', 'SPEED_BUMP', 'GRAVEL', 'WATER_LOGGING'")
+    anomaly_type: str = Field(..., description="'POTHOLE', 'SPEED_BUMP', 'GRAVEL', 'WATER_LOGGING', 'DEGRADED', 'BLOCKED'")
     position: Point3D
     radius_m: float = Field(..., ge=0.1)
     depth_or_height_m: float = Field(0.0, description="Depth if negative, height if positive")
+    traversability_class: TraversabilityClass = Field(default=TraversabilityClass.POTHOLE)
+    severity: float = Field(0.8, ge=0.0, le=1.0, description="Severity rating 0=benign, 1=critical")
+    is_passable: bool = Field(False, description="True if vehicle can safely cross at non-zero speed")
+    max_safe_speed_mps: float = Field(0.0, ge=0.0, description="Max safe crossing speed (m/s), 0.0 if impassable")
+    traversability_score: float = Field(0.05, ge=0.0, le=1.0, description="Normalized traversability: 1.0=asphalt, 0.0=blocked")
+    description: str = Field("Road anomaly", description="Human-readable description")
 
 
 class PerceptionOutput(BaseModel):

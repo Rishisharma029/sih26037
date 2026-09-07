@@ -72,6 +72,23 @@ class SafetySupervisoryLayer:
             planned, ego_state, perception, prediction
         )
 
+        # 3b. Check for Surface Hazard Breach (Severe Potholes / Waterlogging)
+        surface_hazard_breached = False
+        surface_hazard_desc = ""
+        for anom in perception.anomalies:
+            is_passable = getattr(anom, "is_passable", True)
+            max_safe_v = getattr(anom, "max_safe_speed_mps", 0.0 if not is_passable else 5.0)
+            if not is_passable:
+                for wp in planned.waypoints:
+                    wx = getattr(wp, "x", getattr(getattr(wp, "position", None), "x", 0.0))
+                    wy = getattr(wp, "y", getattr(getattr(wp, "position", None), "y", 0.0))
+                    adx = wx - anom.position.x
+                    ady = wy - anom.position.y
+                    if math.hypot(adx, ady) < (anom.radius_m + 0.35) and ego_state.twist.speed_mps > max_safe_v:
+                        surface_hazard_breached = True
+                        surface_hazard_desc = getattr(anom, "description", anom.anomaly_type)
+                        break
+
         closest_dist = min([obs.distance_m for obs in perception.obstacles], default=999.0)
 
         # -------------------------------------------------------------------
@@ -131,22 +148,26 @@ class SafetySupervisoryLayer:
             )
 
         # -------------------------------------------------------------------
-        # TIER 3: DYNAMIC INCURSION / EMERGENCY REPLAN (1.0s <= TTC < 2.0s)
+        # TIER 3: DYNAMIC INCURSION / SURFACE HAZARD / EMERGENCY REPLAN (1.0s <= TTC < 2.0s)
         # -------------------------------------------------------------------
-        if unexpected_incursion or risk.min_ttc_seconds < self.replan_ttc_threshold_s:
+        if unexpected_incursion or surface_hazard_breached or risk.min_ttc_seconds < self.replan_ttc_threshold_s:
             self.rejected_count += 1
             self.emergency_replan_count += 1
             self.last_gate_status = "REJECTED_REPLAN"
-            self.last_rejection_reason = "REJECTED_UNEXPECTED_INCURSION" if unexpected_incursion else "REJECTED_REPLAN_TTC"
+            
+            if surface_hazard_breached:
+                self.last_rejection_reason = "REJECTED_UNSAFE_SURFACE"
+                status_reason = f"UNSAFE_ROAD_SURFACE ({surface_hazard_desc}) -> EMERGENCY_REPLAN"
+            elif unexpected_incursion:
+                self.last_rejection_reason = "REJECTED_UNEXPECTED_INCURSION"
+                status_reason = f"UNEXPECTED_OBSTACLE_INCURSION ({incursion_id}) -> EMERGENCY_REPLAN"
+            else:
+                self.last_rejection_reason = "REJECTED_REPLAN_TTC"
+                status_reason = f"EMERGENCY_REPLAN_TRIGGERED (TTC={risk.min_ttc_seconds:0.2f}s)"
 
             for wp in filtered_traj.waypoints:
                 wp.speed_mps = min(wp.speed_mps, max(1.5, ego_state.twist.speed_mps * 0.5))
                 wp.acceleration_mps2 = -2.5
-
-            if unexpected_incursion:
-                status_reason = f"UNEXPECTED_OBSTACLE_INCURSION ({incursion_id}) -> EMERGENCY_REPLAN"
-            else:
-                status_reason = f"EMERGENCY_REPLAN_TRIGGERED (TTC={risk.min_ttc_seconds:0.2f}s)"
 
             return SafeTrajectory(
                 timestamp=ego_state.timestamp,

@@ -145,7 +145,7 @@ class TrajectoryCostEvaluator:
                 explanation=f"Lateral acceleration {candidate.max_lateral_accel:.2f} m/s² exceeds passenger comfort threshold {self.max_lateral_accel:.2f} m/s²"
             )
 
-        # 3. Road Traversability & Hard Drivable Corridor Invariant
+        # 3. Road Traversability & Surface Anomaly Hard Invariant
         cost_traversability = 0.0
         min_boundary_margin = 999.0
         vehicle_half_width = 0.90
@@ -177,8 +177,6 @@ class TrajectoryCostEvaluator:
             if margin < 0.60:
                 cost_traversability += max(0.0, (0.60 - margin) / 0.60) * 15.0
 
-        cost_traversability = min(100.0, cost_traversability)
-
         # Hard safety invariant: Breaching road ditch boundary
         if min_boundary_margin < safety_buffer:
             default_breakdown["road_traversability"] = 99999.0
@@ -194,6 +192,46 @@ class TrajectoryCostEvaluator:
                 min_boundary_margin_m=round(min_boundary_margin, 3),
                 explanation=f"Ditch clearance {min_boundary_margin:.2f}m violates safety invariant margin ({safety_buffer:.2f}m)"
             )
+
+        # 3b. Road Surface Anomalies (Potholes, Waterlogging, Gravel, Speed Bumps)
+        for anom in perception.anomalies:
+            is_passable = getattr(anom, "is_passable", True)
+            max_safe_v = getattr(anom, "max_safe_speed_mps", 0.0 if not is_passable else 5.0)
+            t_score = getattr(anom, "traversability_score", 0.5)
+            anom_type = getattr(anom, "anomaly_type", "POTHOLE").upper()
+            anom_desc = getattr(anom, "description", anom_type)
+
+            for pt in candidate.waypoints:
+                adx = pt.x - anom.position.x
+                ady = pt.y - anom.position.y
+                adist = math.hypot(adx, ady)
+                collision_radius = anom.radius_m + 0.45  # Vehicle wheel track envelope
+
+                if adist < collision_radius:
+                    # Non-passable hazard (e.g. Deep Pothole, Flood/Waterlogging, Blocked debris)
+                    if not is_passable and candidate.target_v > max_safe_v:
+                        default_breakdown["road_traversability"] = 99999.0
+                        default_breakdown["traversability"] = 99999.0
+                        depth_txt = f", depth {abs(anom.depth_or_height_m)*100:.0f}cm" if anom.depth_or_height_m < 0 else ""
+                        return TrajectoryCostScore(
+                            candidate_id=candidate.candidate_id,
+                            label=candidate.label,
+                            total_cost=99999.0,
+                            is_feasible=False,
+                            status_tag="UNSAFE_TRAVERSABILITY",
+                            cost_breakdown=default_breakdown,
+                            min_clearance_m=round(adist, 2),
+                            min_boundary_margin_m=round(min_boundary_margin, 3),
+                            explanation=f"Technically open, but unsafe to drive through: {anom_desc}{depth_txt} (speed {candidate.target_v:.1f}m/s > {max_safe_v:.1f}m/s)"
+                        )
+
+                    # Passable with speed penalty (e.g. Speed Bump, Gravel, Degraded)
+                    if candidate.target_v > max_safe_v:
+                        overspeed = candidate.target_v - max_safe_v
+                        cost_traversability += overspeed * 18.0
+                    cost_traversability += (1.0 - t_score) * 30.0
+
+        cost_traversability = min(100.0, cost_traversability)
 
         # 4. Spatio-temporal Collision Safety & Prediction Risk
         cost_collision = 0.0
@@ -352,3 +390,7 @@ class TrajectoryCostEvaluator:
             min_boundary_margin_m=round(min_boundary_margin, 2),
             explanation=explanation_str
         )
+
+
+MultiObjectiveCostEvaluator = TrajectoryCostEvaluator
+

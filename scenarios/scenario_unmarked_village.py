@@ -1,7 +1,7 @@
 """Unmarked Village Road Scenario for SIH26037 Evaluation."""
 import math
 from typing import List, Optional
-from interfaces import ObstacleClass, RoadAnomaly, Point3D
+from interfaces import ObstacleClass, RoadAnomaly, Point3D, TraversabilityClass
 from simulation.environment import RoadEnvironment, SimulationActor, VillageRoadGeometry
 from simulation.actors import (
     TractorActor, PedestrianActor, MotorcycleActor,
@@ -160,6 +160,82 @@ class UnmarkedVillageRoadScenario(BaseScenario):
         )
         self.env.add_actor(auto)
         return auto
+
+    def spawn_pothole(self, dist_ahead: float = 25.0, y: float = 0.0, depth_m: float = -0.15, radius_m: float = 0.75):
+        """Dynamically inject a severe structural pothole."""
+        ego_x = self.simulator.state.pose.position.x
+        pothole = RoadAnomaly(
+            id=f"pothole_{len(self.env.anomalies)+1}",
+            anomaly_type="POTHOLE",
+            position=Point3D(x=round(ego_x + dist_ahead, 2), y=round(y, 2), z=round(depth_m, 2)),
+            radius_m=radius_m,
+            depth_or_height_m=depth_m,
+            traversability_class=TraversabilityClass.POTHOLE,
+            severity=0.90,
+            is_passable=False,
+            max_safe_speed_mps=0.0,
+            traversability_score=0.05,
+            description=f"Deep crater pothole ({int(depth_m*100)}cm depth)"
+        )
+        self.env.add_anomaly(pothole)
+        return pothole
+
+    def spawn_waterlogged_area(self, dist_ahead: float = 28.0, y: float = 0.2, depth_m: float = -0.16, radius_m: float = 1.6):
+        """Dynamically inject a flooded waterlogged hazard zone."""
+        ego_x = self.simulator.state.pose.position.x
+        waterlog = RoadAnomaly(
+            id=f"waterlog_{len(self.env.anomalies)+1}",
+            anomaly_type="WATER_LOGGING",
+            position=Point3D(x=round(ego_x + dist_ahead, 2), y=round(y, 2), z=round(depth_m, 2)),
+            radius_m=radius_m,
+            depth_or_height_m=depth_m,
+            traversability_class=TraversabilityClass.WATERLOGGED,
+            severity=0.88,
+            is_passable=False,
+            max_safe_speed_mps=0.8,
+            traversability_score=0.20,
+            description="Submerged murky flood pool"
+        )
+        self.env.add_anomaly(waterlog)
+        return waterlog
+
+    def spawn_gravel_patch(self, dist_ahead: float = 22.0, y: float = -0.3, radius_m: float = 1.8):
+        """Dynamically inject a loose gravel aggregate patch."""
+        ego_x = self.simulator.state.pose.position.x
+        gravel = RoadAnomaly(
+            id=f"gravel_{len(self.env.anomalies)+1}",
+            anomaly_type="GRAVEL",
+            position=Point3D(x=round(ego_x + dist_ahead, 2), y=round(y, 2), z=-0.02),
+            radius_m=radius_m,
+            depth_or_height_m=-0.02,
+            traversability_class=TraversabilityClass.GRAVEL,
+            severity=0.45,
+            is_passable=True,
+            max_safe_speed_mps=2.5,
+            traversability_score=0.50,
+            description="Loose unpaved stone gravel"
+        )
+        self.env.add_anomaly(gravel)
+        return gravel
+
+    def spawn_speed_bump(self, dist_ahead: float = 30.0, y: float = 0.0, height_m: float = 0.12, radius_m: float = 1.5):
+        """Dynamically inject an unmarked concrete speed hump."""
+        ego_x = self.simulator.state.pose.position.x
+        bump = RoadAnomaly(
+            id=f"speed_bump_{len(self.env.anomalies)+1}",
+            anomaly_type="SPEED_BUMP",
+            position=Point3D(x=round(ego_x + dist_ahead, 2), y=round(y, 2), z=round(height_m, 2)),
+            radius_m=radius_m,
+            depth_or_height_m=height_m,
+            traversability_class=TraversabilityClass.SPEED_BUMP,
+            severity=0.60,
+            is_passable=True,
+            max_safe_speed_mps=1.5,
+            traversability_score=0.40,
+            description="Unmarked steep speed hump"
+        )
+        self.env.add_anomaly(bump)
+        return bump
 
 
 def build_unmarked_village_environment() -> RoadEnvironment:

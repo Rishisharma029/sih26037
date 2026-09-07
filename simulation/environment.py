@@ -3,7 +3,10 @@ from enum import Enum
 import math
 import numpy as np
 from typing import List, Tuple, Optional
-from interfaces import Point3D, Vector3D, Pose3D, Twist3D, ObstacleClass, RoadAnomaly, EgoVehicleState, ControlCommand
+from interfaces import (
+    Point3D, Vector3D, Pose3D, Twist3D, ObstacleClass,
+    RoadAnomaly, TraversabilityClass, EgoVehicleState, ControlCommand
+)
 from .actors import SimulationActor
 from .vehicle_model import KinematicBicycleModel
 
@@ -69,25 +72,92 @@ class VillageRoadGeometry:
         return d_left, d_right
 
     def get_default_anomalies(self) -> List[RoadAnomaly]:
-        """Returns standard unstructured Indian road anomalies (potholes, speed bumps, gravel heaps)."""
+        """Returns standard unstructured Indian road anomalies (potholes, waterlogged pools, gravel, speed bumps)."""
         anomalies = []
-        p1_x, p1_y, _ = self.frenet_to_cartesian(24.0, 0.5)
+        p1_x, p1_y, _ = self.frenet_to_cartesian(24.0, 0.45)
         anomalies.append(RoadAnomaly(
             id="pothole_km_24",
             anomaly_type="POTHOLE",
-            position=Point3D(x=round(p1_x, 2), y=round(p1_y, 2), z=-0.09),
-            radius_m=0.55,
-            depth_or_height_m=-0.09
+            position=Point3D(x=round(p1_x, 2), y=round(p1_y, 2), z=-0.12),
+            radius_m=0.65,
+            depth_or_height_m=-0.12,
+            traversability_class=TraversabilityClass.POTHOLE,
+            severity=0.85,
+            is_passable=False,
+            max_safe_speed_mps=0.0,
+            traversability_score=0.05,
+            description="Deep rim-damaging pothole crater (depth -12cm)"
         ))
-        sb1_x, sb1_y, _ = self.frenet_to_cartesian(52.0, 0.0)
+        g1_x, g1_y, _ = self.frenet_to_cartesian(38.0, -0.40)
         anomalies.append(RoadAnomaly(
-            id="speed_bump_km_52",
-            anomaly_type="SPEED_BUMP",
-            position=Point3D(x=round(sb1_x, 2), y=round(sb1_y, 2), z=0.10),
+            id="gravel_km_38",
+            anomaly_type="GRAVEL",
+            position=Point3D(x=round(g1_x, 2), y=round(g1_y, 2), z=-0.02),
+            radius_m=1.8,
+            depth_or_height_m=-0.02,
+            traversability_class=TraversabilityClass.GRAVEL,
+            severity=0.45,
+            is_passable=True,
+            max_safe_speed_mps=2.5,
+            traversability_score=0.50,
+            description="Loose gravel stone aggregates"
+        ))
+        w1_x, w1_y, _ = self.frenet_to_cartesian(54.0, 0.35)
+        anomalies.append(RoadAnomaly(
+            id="waterlog_km_54",
+            anomaly_type="WATER_LOGGING",
+            position=Point3D(x=round(w1_x, 2), y=round(w1_y, 2), z=-0.15),
             radius_m=1.6,
-            depth_or_height_m=0.10
+            depth_or_height_m=-0.15,
+            traversability_class=TraversabilityClass.WATERLOGGED,
+            severity=0.90,
+            is_passable=False,
+            max_safe_speed_mps=0.8,
+            traversability_score=0.20,
+            description="Submerged murky flood pool hiding subsurface depth"
+        ))
+        sb1_x, sb1_y, _ = self.frenet_to_cartesian(72.0, 0.0)
+        anomalies.append(RoadAnomaly(
+            id="speed_bump_km_72",
+            anomaly_type="SPEED_BUMP",
+            position=Point3D(x=round(sb1_x, 2), y=round(sb1_y, 2), z=0.11),
+            radius_m=1.5,
+            depth_or_height_m=0.11,
+            traversability_class=TraversabilityClass.SPEED_BUMP,
+            severity=0.60,
+            is_passable=True,
+            max_safe_speed_mps=1.5,
+            traversability_score=0.40,
+            description="Unmarked steep concrete speed hump"
         ))
         return anomalies
+
+    def get_surface_condition_at(
+        self,
+        s: float,
+        d: float,
+        anomalies: Optional[List[RoadAnomaly]] = None
+    ) -> Tuple[TraversabilityClass, float, Optional[RoadAnomaly]]:
+        """Evaluates road surface condition and traversability at Frenet station (s, d)."""
+        x, y, _ = self.frenet_to_cartesian(s, d)
+        d_left, d_right = self.get_corridor_widths(s)
+
+        # Off-road ditch breach
+        if d > d_left or d < d_right:
+            return TraversabilityClass.BLOCKED, 0.0, None
+
+        if anomalies:
+            for anom in anomalies:
+                dx = x - anom.position.x
+                dy = y - anom.position.y
+                if math.hypot(dx, dy) <= anom.radius_m:
+                    return anom.traversability_class, anom.traversability_score, anom
+
+        # Degraded rough tarmac zones
+        if 85.0 <= s <= 98.0:
+            return TraversabilityClass.DEGRADED, 0.75, None
+
+        return TraversabilityClass.SAFE, 1.0, None
 
     def frenet_to_cartesian(self, s: float, d: float) -> Tuple[float, float, float]:
         cx, cy, cyaw = self.get_centerline_point(s)

@@ -130,14 +130,13 @@ class SimulationEngineState:
         elif hazard_type == "cattle":
             self.scenario.spawn_cattle(dist_ahead=max(18.0, dist_ahead * 0.7), y=-1.1, speed_mps=0.6)
         elif hazard_type == "pothole":
-            p_x, p_y, _ = self.scenario.env.geometry.frenet_to_cartesian(self.scenario.simulator.state.pose.position.x + 18.0, 0.0)
-            self.scenario.env.add_anomaly(RoadAnomaly(
-                id=f"injected_pothole_{len(self.scenario.env.anomalies)+1}",
-                anomaly_type="POTHOLE",
-                position=Point3D(x=round(p_x, 2), y=round(p_y, 2), z=-0.15),
-                radius_m=0.8,
-                depth_or_height_m=-0.15
-            ))
+            self.scenario.spawn_pothole(dist_ahead=max(16.0, dist_ahead * 0.7), y=0.0, depth_m=-0.16, radius_m=0.85)
+        elif hazard_type == "waterlogged":
+            self.scenario.spawn_waterlogged_area(dist_ahead=max(18.0, dist_ahead * 0.75), y=0.2, depth_m=-0.18, radius_m=1.6)
+        elif hazard_type == "gravel":
+            self.scenario.spawn_gravel_patch(dist_ahead=max(16.0, dist_ahead * 0.65), y=-0.3, radius_m=1.9)
+        elif hazard_type == "speed_bump":
+            self.scenario.spawn_speed_bump(dist_ahead=max(20.0, dist_ahead * 0.8), y=0.0, height_m=0.12, radius_m=1.5)
 
     def step(self):
         if not self.is_running:
@@ -269,6 +268,11 @@ class SimulationEngineState:
             anomalies_data.append({
                 "id": anom.id,
                 "type": anom.anomaly_type,
+                "traversability_class": getattr(anom, "traversability_class", "POTHOLE"),
+                "is_passable": getattr(anom, "is_passable", False),
+                "max_safe_speed_mps": getattr(anom, "max_safe_speed_mps", 0.0),
+                "traversability_score": getattr(anom, "traversability_score", 0.05),
+                "description": getattr(anom, "description", anom.anomaly_type),
                 "x_world": round(anom.position.x, 2),
                 "y_world": round(anom.position.y, 2),
                 "x_ego": round(xEgo, 2),
@@ -699,6 +703,15 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                     <button onclick="spawnHazard('pothole')" class="px-2.5 py-1 rounded bg-red-500/20 hover:bg-red-500/30 text-red-300 border border-red-500/40 text-[11px] font-bold transition">
                         🕳️ Pothole
                     </button>
+                    <button onclick="spawnHazard('waterlogged')" class="px-2.5 py-1 rounded bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 border border-sky-500/40 text-[11px] font-bold transition">
+                        🌊 Flood Pool
+                    </button>
+                    <button onclick="spawnHazard('gravel')" class="px-2.5 py-1 rounded bg-orange-600/20 hover:bg-orange-600/30 text-orange-300 border border-orange-600/40 text-[11px] font-bold transition">
+                        🧱 Gravel
+                    </button>
+                    <button onclick="spawnHazard('speed_bump')" class="px-2.5 py-1 rounded bg-yellow-600/20 hover:bg-yellow-600/30 text-yellow-300 border border-yellow-600/40 text-[11px] font-bold transition">
+                        ⚠️ Speed Bump
+                    </button>
                 </div>
             </div>
 
@@ -713,9 +726,9 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                 <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-cyan-400/40 border border-cyan-400"></span> Candidates (P1..P7)</div>
                 <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-amber-400 border border-amber-400"></span> Forecast 60%</div>
                 <div class="flex items-center gap-1.5"><span class="w-3 h-1.5 rounded bg-rose-500 border border-rose-500"></span> Cut-In 25% ⚠️</div>
-                <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-red-950 border border-red-500"></span> Potholes & Craters</div>
+                <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-red-950 border border-red-500"></span> 🕳️ Potholes</div>
+                <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full bg-sky-950 border border-sky-400"></span> 🌊 Flooded Pool</div>
                 <div class="flex items-center gap-1.5"><span class="w-3 h-1 bg-yellow-400"></span> Speed Bumps</div>
-                <div class="flex items-center gap-1.5"><span class="w-3 h-0.5 bg-amber-400"></span> Velocity (→)</div>
                 <div class="flex items-center gap-1.5"><span class="w-2.5 h-2.5 rounded-full border border-yellow-400 text-yellow-400 font-mono text-[9px] flex items-center justify-center">🎯</span> Goal Horizon</div>
             </div>
         </div>
@@ -1034,6 +1047,9 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                 } else if (c.status_tag === 'UNSAFE_CLEARANCE') {
                     statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-amber-950 text-amber-300 border border-amber-800">UNSAFE CLR</span>';
                     tr.className = 'hover:bg-slate-900/60 text-amber-200/80';
+                } else if (c.status_tag === 'UNSAFE_TRAVERSABILITY') {
+                    statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-red-950 text-red-300 border border-red-800 font-bold">UNSAFE SURF</span>';
+                    tr.className = 'bg-red-950/20 text-red-300/80';
                 } else if (c.status_tag === 'COLLISION') {
                     statusBadge = '<span class="px-1.5 py-0.5 rounded text-[10px] bg-rose-950 text-rose-300 border border-rose-800 font-bold">COLLISION</span>';
                     tr.className = 'bg-rose-950/20 text-rose-300/80';
@@ -1211,13 +1227,18 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                 }
             }
 
-            // 3. Road Anomalies (Potholes, Speed Bumps, Gravel Heaps)
+            // 3. Road Anomalies (Potholes, Waterlogging, Speed Bumps, Gravel)
             (data.anomalies || []).forEach(an => {
                 const scr = worldToScreen(an.x_world, an.y_world);
-                const rPix = an.radius_m * scale;
+                const rPix = Math.max(8, an.radius_m * scale);
 
                 if (an.type === 'POTHOLE') {
-                    ctx.fillStyle = '#0f172a';
+                    // Dark crater with red danger ring
+                    const grad = ctx.createRadialGradient(scr.sx, scr.sy, 2, scr.sx, scr.sy, rPix);
+                    grad.addColorStop(0, '#000000');
+                    grad.addColorStop(0.7, '#450a0a');
+                    grad.addColorStop(1, '#991b1b');
+                    ctx.fillStyle = grad;
                     ctx.strokeStyle = '#ef4444';
                     ctx.lineWidth = 2.0;
                     ctx.beginPath();
@@ -1225,7 +1246,7 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                     ctx.fill();
                     ctx.stroke();
 
-                    ctx.strokeStyle = 'rgba(239, 68, 68, 0.5)';
+                    ctx.strokeStyle = 'rgba(239, 68, 68, 0.6)';
                     ctx.lineWidth = 1.0;
                     ctx.beginPath();
                     ctx.arc(scr.sx, scr.sy, rPix * 0.5, 0, Math.PI * 2);
@@ -1234,9 +1255,28 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
                     ctx.fillStyle = '#fca5a5';
                     ctx.font = 'bold 8px monospace';
                     ctx.fillText(`🕳️ ${Math.round(an.depth_or_height_m * 100)}cm`, scr.sx + rPix + 3, scr.sy + 3);
+                } else if (an.type === 'WATER_LOGGING' || an.type === 'WATERLOGGED') {
+                    // Shimmering flooded blue pool with ripple rings
+                    ctx.fillStyle = 'rgba(14, 165, 233, 0.45)';
+                    ctx.strokeStyle = '#38bdf8';
+                    ctx.lineWidth = 2.0;
+                    ctx.beginPath();
+                    ctx.arc(scr.sx, scr.sy, rPix, 0, Math.PI * 2);
+                    ctx.fill();
+                    ctx.stroke();
+
+                    ctx.strokeStyle = 'rgba(186, 230, 253, 0.7)';
+                    ctx.lineWidth = 1.2;
+                    ctx.beginPath();
+                    ctx.arc(scr.sx, scr.sy, rPix * 0.6, 0, Math.PI * 2);
+                    ctx.stroke();
+
+                    ctx.fillStyle = '#bae6fd';
+                    ctx.font = 'bold 8px monospace';
+                    ctx.fillText(`🌊 WATER (${Math.round(an.depth_or_height_m * 100)}cm)`, scr.sx + rPix + 3, scr.sy + 3);
                 } else if (an.type === 'SPEED_BUMP') {
                     ctx.strokeStyle = '#fde047';
-                    ctx.lineWidth = 4.0;
+                    ctx.lineWidth = 4.5;
                     ctx.beginPath();
                     ctx.moveTo(scr.sx - rPix * 1.5, scr.sy);
                     ctx.lineTo(scr.sx + rPix * 1.5, scr.sy);
