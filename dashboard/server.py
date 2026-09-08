@@ -2013,36 +2013,38 @@ def create_app(sim_engine: SimulationEngineState) -> FastAPI:
 
                 ctx.restore();
 
-                // Velocity Vector Arrow (Amber #f59e0b)
+                // Velocity Vector Arrow (Amber #f59e0b) - Strictly in Ego Coordinates
                 if (act.speed_mps > 0.3) {
-                    const endX_world = act.x_world + act.vx_ego * 1.5;
-                    const endY_world = act.y_world + act.vy_ego * 1.5;
-                    const endScr = worldToScreen(endX_world, endY_world);
+                    const end_xEgo = act.x_ego + act.vx_ego * 1.5;
+                    const end_yEgo = act.y_ego + act.vy_ego * 1.5;
+                    const end_sx = originX - end_yEgo * scale;
+                    const end_sy = originY - end_xEgo * scale;
 
                     ctx.strokeStyle = '#f59e0b';
                     ctx.lineWidth = 2.0;
                     ctx.beginPath();
                     ctx.moveTo(scr.sx, scr.sy);
-                    ctx.lineTo(endScr.sx, endScr.sy);
+                    ctx.lineTo(end_sx, end_sy);
                     ctx.stroke();
                 }
 
-                // Acceleration Vector Arrow (Purple #c084fc)
+                // Acceleration Vector Arrow (Purple #c084fc) - Strictly in Ego Coordinates
                 if (act.accel_mps2 > 0.4) {
-                    const aEndX_world = act.x_world + act.ax_ego * 1.0;
-                    const aEndY_world = act.y_world + act.ay_ego * 1.0;
-                    const aEndScr = worldToScreen(aEndX_world, aEndY_world);
+                    const aEnd_xEgo = act.x_ego + act.ax_ego * 1.0;
+                    const aEnd_yEgo = act.y_ego + act.ay_ego * 1.0;
+                    const aEnd_sx = originX - aEnd_yEgo * scale;
+                    const aEnd_sy = originY - aEnd_xEgo * scale;
 
                     ctx.strokeStyle = '#c084fc';
                     ctx.lineWidth = 2.0;
                     ctx.beginPath();
                     ctx.moveTo(scr.sx, scr.sy);
-                    ctx.lineTo(aEndScr.sx, aEndScr.sy);
+                    ctx.lineTo(aEnd_sx, aEnd_sy);
                     ctx.stroke();
 
                     ctx.fillStyle = '#e9d5ff';
                     ctx.font = 'bold 8px monospace';
-                    ctx.fillText(`a: ${act.accel_mps2}m/s²`, aEndScr.sx + 2, aEndScr.sy - 2);
+                    ctx.fillText(`a: ${act.accel_mps2}m/s²`, aEnd_sx + 2, aEnd_sy - 2);
                 }
 
                 // Actor Label Badge with Intent and Multi-Frame Memory Length
